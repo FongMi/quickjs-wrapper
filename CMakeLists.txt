@@ -3,7 +3,7 @@ set(QUICKJS_PATH "../../../native/quickjs")
 file(STRINGS "${QUICKJS_PATH}/VERSION" CONFIG_VERSION)
 
 add_definitions(-DCONFIG_VERSION=\"${CONFIG_VERSION}\")
-add_definitions(-DCONFIG_BIGNUM)
+#add_definitions(-DCONFIG_BIGNUM)
 
 file(GLOB wrapper_src
         "../../../native/cpp/*.cpp"
