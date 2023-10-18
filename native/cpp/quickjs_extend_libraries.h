@@ -171,10 +171,6 @@ const char *CONSOLE = R"lit(// Init format at first.
             return `Float64Array(1) [ ${value} ]`
         }
 
-        if (value instanceof BigInt64Array) {
-            return `BigInt64Array(1) [ ${value}n ]`
-        }
-
         if (value instanceof Map) {
             return formatMap(value, opt, recurseTimes)
         }
