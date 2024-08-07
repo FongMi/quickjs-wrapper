@@ -3,13 +3,13 @@ plugins {
 }
 
 android {
-    namespace 'com.whl.quickjs.android'
-
-    compileSdk 35
+    compileSdkVersion 30
 
     defaultConfig {
-        minSdk 21
-        targetSdk 35
+        minSdkVersion 18
+        targetSdkVersion 30
+        versionCode 1
+        versionName "1.0"
 
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         consumerProguardFiles "consumer-rules.pro"
@@ -17,7 +17,6 @@ android {
         externalNativeBuild {
             cmake {
                 cppFlags ''
-                abiFilters 'armeabi-v7a', 'arm64-v8a', 'x86'
             }
         }
     }
@@ -42,8 +41,8 @@ android {
 }
 
 dependencies {
-    api project(':wrapper-java')
-    testImplementation 'junit:junit:4.13.2'
-    androidTestImplementation 'androidx.test.ext:junit:1.2.1'
-    androidTestImplementation 'androidx.test.espresso:espresso-core:3.6.1'
+    api api(project(':wrapper-java',))
+    testImplementation 'junit:junit:4.+'
+    androidTestImplementation 'androidx.test.ext:junit:1.1.2'
+    androidTestImplementation 'androidx.test.espresso:espresso-core:3.3.0'
 }
