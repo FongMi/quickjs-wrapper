@@ -5,7 +5,6 @@ QuickJS wrapper for Android/JVM.
 - Java types are supported with JavaScript
 - Support promise execute
 - JavaScript exception handler
-- Optimize not a function with its name when type error
 - Compile bytecode
 
 Experimental Features Stability not guaranteed.
@@ -75,7 +74,7 @@ git submodule update --init
 ### Initialization
 In Android Platforms:
 ```Java
-// It is usually init in the application.
+// You usually need to initialize it before using it..
 QuickJSLoader.init();
 ```
 
@@ -90,23 +89,18 @@ QuickJSContext context = QuickJSContext.create();
 ### Destroy QuickJSContext
 
 ```Java
-QuickJSContext context = QuickJSContext.create();
 context.destroy();
 ```
 
 ### Evaluating JavaScript
 
 ```Java
-QuickJSContext context = QuickJSContext.create();
 context.evaluate("var a = 1 + 2;");
 ```
 
 ### Console Support
 ```Java
-QuickJSContext context = QuickJSContext.create();
-QuickJSLoader.initConsoleLog(context);
-// or custom console.
-// QuickJSLoader.initConsoleLog(context, your console implementation.);
+context.setConsole(your console implementation.);
 ```
 
 ### Supported Types
@@ -132,7 +126,8 @@ There is no Long type in JavaScript, the conversion of Long type is special.
     - The Long value > Number.MAX_SAFE_INTEGER, will be convert to BigInt type.
     - Number.MIN_SAFE_INTEGER is the same to above.
 
-- JavaScript --> Java: Number(Int64) or BigInt --> Long type
+- JavaScript --> Java
+    - Number(Int64) or BigInt --> Long type
 
 ### Set Property
 Java
