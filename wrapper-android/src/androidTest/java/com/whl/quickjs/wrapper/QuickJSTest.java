@@ -1197,7 +1197,7 @@ public class QuickJSTest {
     @Test
     public void testObjectToMap() {
         QuickJSContext context = createContext();
-        JSObject ret = (JSObject) context.evaluate("var a = {'a': '123', 'b': [1, 2]};a.c = a;;a;");
+        JSObject ret = (JSObject) context.evaluate("var a = {'a': '123', 'b': [1, 2]};a.c = a;a;");
         assertEquals("{a=123, b=[1, 2]}", ret.toMap().toString());
         ret.release();
 
@@ -1205,7 +1205,12 @@ public class QuickJSTest {
         assertEquals("[{a={c=xxx}}, 2, qqq, 1.22]", array.toArray().toString());
         array.release();
 
-        assertEquals("{a={a=123, b=[1, 2]}, b=[{a={c=xxx}}, 2, qqq, 1.22], Infinity=-9223372036854775808, NaN=NaN, Math={LN2=0.6931471805599453, LN10=2.302585092994046, LOG2E=1.4426950408889634, E=2.718281828459045, SQRT2=1.4142135623730951, LOG10E=0.4342944819032518, PI=3.141592653589793, SQRT1_2=0.7071067811865476}, undefined=null}", context.getGlobalObject().toMap().toString());
+        assertEquals("{console={}, a={a=123, b=[1, 2]}, b=[{a={c=xxx}}, 2, qqq, 1.22], Infinity=-9223372036854775808, Reflect={}, NaN=NaN, JSON={}, Math={LN2=0.6931471805599453, LN10=2.302585092994046, LOG2E=1.4426950408889634, E=2.718281828459045, SQRT2=1.4142135623730951, LOG10E=0.4342944819032518, PI=3.141592653589793, SQRT1_2=0.7071067811865476}, Atomics={}, undefined=null}", context.getGlobalObject().toMap().toString());
+
+        JSObject emptyObj = (JSObject) context.evaluate("var a = { emptyArray: [] };a;");
+        assertEquals("{emptyArray=[]}", emptyObj.toMap().toString());
+        emptyObj.release();
+
         context.destroy();
     }
 
@@ -1217,7 +1222,7 @@ public class QuickJSTest {
             return key.equals("Infinity");
         }, "test");
         System.out.println(map.toString());
-        assertEquals("{NaN=NaN, Math={LN2=0.6931471805599453, LN10=2.302585092994046, LOG2E=1.4426950408889634, E=2.718281828459045, SQRT2=1.4142135623730951, LOG10E=0.4342944819032518, PI=3.141592653589793, SQRT1_2=0.7071067811865476}, undefined=null}", map.toString());
+        assertEquals("{console={}, Reflect={}, NaN=NaN, JSON={}, Math={LN2=0.6931471805599453, LN10=2.302585092994046, LOG2E=1.4426950408889634, E=2.718281828459045, SQRT2=1.4142135623730951, LOG10E=0.4342944819032518, PI=3.141592653589793, SQRT1_2=0.7071067811865476}, Atomics={}, undefined=null}", map.toString());
         context.destroy();
     }
 
@@ -1233,6 +1238,28 @@ public class QuickJSTest {
         o.setProperty("name", "leak1");
         // o.release();
 
+        context.destroy();
+    }
+
+    @Test
+    public void testArrayBytes() {
+        QuickJSContext context = createContext();
+        byte[] bytes = "test测试".getBytes();
+        byte[] buffer = (byte[]) context.evaluate("new Int8Array([116, 101, 115, 116, -26, -75, -117, -24, -81, -107]).buffer");
+        assertArrayEquals(bytes, buffer);
+
+        context.getGlobalObject().setProperty("testBuffer", bytes);
+        byte[] testBuffers = context.getGlobalObject().getBytes("testBuffer");
+        assertArrayEquals(testBuffers, buffer);
+
+        context.destroy();
+    }
+
+    @Test
+    public void testArrayBytes1() {
+        QuickJSContext context = createContext();
+        JSFunction bufferTest = (JSFunction) context.evaluate("const bufferTest = (buffer) => { if(new Int8Array(buffer)[0] !== 116) { throw Error('failed, not equal'); }; }; bufferTest;");
+        bufferTest.callVoid("test测试".getBytes());
         context.destroy();
     }
 

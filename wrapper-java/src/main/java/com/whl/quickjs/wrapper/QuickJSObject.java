@@ -85,6 +85,11 @@ public class QuickJSObject implements JSObject {
     }
 
     @Override
+    public void setProperty(String name, byte[] value) {
+        setPropertyObject(name, value);
+    }
+
+    @Override
     public void setProperty(String name, JSCallFunction value) {
         setPropertyObject(name, value);
     }
@@ -174,6 +179,12 @@ public class QuickJSObject implements JSObject {
     public Long getLong(String name) {
         Object value = getProperty(name);
         return value instanceof Long ? (Long) value : null;
+    }
+
+    @Override
+    public byte[] getBytes(String name) {
+        Object value = getProperty(name);
+        return value instanceof byte[] ? (byte[]) value : null;
     }
 
     @Override
@@ -277,14 +288,11 @@ public class QuickJSObject implements JSObject {
         return toArray(filter, null);
     }
 
+    /**
+     * 注意点：循环引用的对象会被过滤掉
+     */
     protected void convertToMap(Object target, Object map, HashSet<Long> circulars, MapFilter filter, Object extra) {
-        long pointer = ((JSObject) target).getPointer();
-        if (circulars.contains(pointer)) {
-            // Circular reference objects, no processing needed.
-            return;
-        }
-
-        circulars.add(pointer);
+        circulars.add(((JSObject) target).getPointer());
 
         boolean isArray = target instanceof JSArray;
         JSArray array = isArray ? (JSArray) target : ((JSObject) target).getNames();
@@ -302,6 +310,14 @@ public class QuickJSObject implements JSObject {
                 value = ((JSObject) target).getProperty(key);
             }
 
+            if (value instanceof JSObject) {
+                long pointer = ((JSObject) value).getPointer();
+                if (circulars.contains(pointer)) {
+                    // Circular reference objects, no processing needed.
+                    continue;
+                }
+            }
+
             if (value instanceof JSFunction) {
                 // Unsupported type.
                 ((JSFunction) value).release();
@@ -311,12 +327,10 @@ public class QuickJSObject implements JSObject {
             if (value instanceof JSArray) {
                 ArrayList<Object> list = new ArrayList<>(((JSArray) value).length());
                 convertToMap(value, list, circulars, filter, extra);
-                if (!list.isEmpty()) {
-                    if (map instanceof HashMap) {
-                        ((HashMap<String, Object>) map).put(key, list);
-                    } else if (map instanceof ArrayList){
-                        ((ArrayList<Object>) map).add(list);
-                    }
+                if (map instanceof HashMap) {
+                    ((HashMap<String, Object>) map).put(key, list);
+                } else if (map instanceof ArrayList){
+                    ((ArrayList<Object>) map).add(list);
                 }
                 ((JSArray) value).release();
                 continue;
@@ -325,12 +339,10 @@ public class QuickJSObject implements JSObject {
             if (value instanceof JSObject) {
                 HashMap<String, Object> valueMap = new HashMap<>();
                 convertToMap(value, valueMap, circulars, filter, extra);
-                if (!valueMap.isEmpty()) {
-                    if (map instanceof HashMap) {
-                        ((HashMap<String, Object>) map).put(key, valueMap);
-                    } else if (map instanceof ArrayList){
-                        ((ArrayList<Object>) map).add(valueMap);
-                    }
+                if (map instanceof HashMap) {
+                    ((HashMap<String, Object>) map).put(key, valueMap);
+                } else if (map instanceof ArrayList){
+                    ((ArrayList<Object>) map).add(valueMap);
                 }
                 ((JSObject) value).release();
                 continue;
