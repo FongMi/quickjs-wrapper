@@ -1120,6 +1120,8 @@ public final class QuickJS implements AutoCloseable {
         else destroyed.completeExceptionally(failure);
     }
 
+    static native void writeConsole(int priority, byte[] message);
+
     private native long create();
 
     private native long acquireBuffer(long handle, Reference value);
