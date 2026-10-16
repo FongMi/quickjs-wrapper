@@ -15,5 +15,6 @@ dependencyResolutionManagement {
 }
 
 rootProject.name = 'quickjs-wrapper'
+if (providers.gradleProperty('androidRuntime').getOrElse('false').toBoolean()) include ':runtime'
 
 if (file('tests/settings.gradle').isFile()) apply from: 'tests/settings.gradle'
