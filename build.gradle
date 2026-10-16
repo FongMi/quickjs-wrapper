@@ -1,0 +1,41 @@
+plugins {
+    id 'java-library'
+    id 'maven-publish'
+}
+
+group = 'com.fongmi.quickjs'
+version = '0.1.0-SNAPSHOT'
+
+base { archivesName = 'wrapper-java' }
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_17
+    targetCompatibility = JavaVersion.VERSION_17
+    withSourcesJar()
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+    options.release = 17
+}
+
+publishing {
+    publications {
+        javaApi(MavenPublication) {
+            from components.java
+            artifactId = 'wrapper-java'
+            pom {
+                name = 'FongMi QuickJS Java API'
+                description = 'Java API for the FongMi QuickJS-NG wrapper. Native runtime is distributed separately.'
+                licenses {
+                    license {
+                        name = 'MIT License'
+                        url = 'https://opensource.org/license/mit'
+                    }
+                }
+            }
+        }
+    }
+}
+
+if (file('tests/local.gradle').isFile()) apply from: 'tests/local.gradle'

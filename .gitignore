@@ -1,0 +1,17 @@
+.gradle/
+.cxx/
+build/
+**/build/
+local.properties
+.idea/
+*.iml
+src/test/
+native/tests/
+tests/
+scripts/tests/
+scripts/test-*.ps1
+scripts/test_standards.py
+scripts/run_text_ldplayer.py
+scripts/tv-integration-tests.init.gradle
+scripts/requirements-test*.txt
+docs/TESTING.md

@@ -1,0 +1,4 @@
+[submodule "vendor/quickjs"]
+	path = vendor/quickjs
+	url = https://github.com/FongMi/quickjs.git
+	branch = fongmi
