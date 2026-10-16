@@ -51,7 +51,7 @@ else()
     target_link_libraries(quickjs-core PUBLIC Threads::Threads "${CMAKE_DL_LIBS}" m)
 endif()
 
-add_library(quickjs-wrapper SHARED native/quickjs_jni.cpp)
+add_library(quickjs-wrapper SHARED native/quickjs_jni.cpp native/console.cpp)
 set_target_properties(quickjs-wrapper PROPERTIES
     CXX_VISIBILITY_PRESET hidden
     VISIBILITY_INLINES_HIDDEN ON
@@ -68,6 +68,7 @@ if(QUICKJS_ENABLE_THIN_LTO)
 endif()
 
 if(ANDROID)
+    target_link_libraries(quickjs-wrapper PRIVATE log)
     if(ANDROID_NDK_MAJOR AND ANDROID_NDK_MAJOR LESS 26)
         message(FATAL_ERROR "QuickJS-NG requires Android NDK 26 or newer")
     endif()
