@@ -1,0 +1,30 @@
+plugins { id 'com.android.library' version '9.4.0' }
+
+android {
+    namespace = 'com.fongmi.quickjs.runtime'
+    enableKotlin = false
+    compileSdk = 37
+    ndkVersion = providers.gradleProperty('ndkVersion').getOrElse('29.0.14206865')
+
+    defaultConfig {
+        minSdk = 24
+        ndk { abiFilters 'arm64-v8a', 'armeabi-v7a' }
+        externalNativeBuild {
+            cmake {
+                arguments '-DANDROID_STL=c++_static', '-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON'
+                arguments "-DQUICKJS_ENABLE_THIN_LTO=${providers.gradleProperty('quickjsThinLto').getOrElse('false').toBoolean() ? 'ON' : 'OFF'}"
+                targets 'quickjs-wrapper'
+            }
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path = file('../CMakeLists.txt')
+            version = '3.22.1'
+        }
+    }
+
+    buildFeatures { buildConfig = false }
+    packaging.jniLibs { useLegacyPackaging = false }
+}
