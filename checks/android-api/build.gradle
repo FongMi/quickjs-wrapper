@@ -1,0 +1,23 @@
+plugins { id 'com.android.library' version '9.4.0' }
+
+android {
+    namespace = 'com.fongmi.quickjs.apicheck'
+    enableKotlin = false
+    compileSdk = 37
+    defaultConfig { minSdk = 24 }
+    sourceSets.main.java.srcDir '../../src/main/java'
+    compileOptions {
+        coreLibraryDesugaringEnabled = true
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    lint {
+        checkOnly 'NewApi', 'InlinedApi'
+        abortOnError = true
+        textReport = true
+        xmlReport = true
+        htmlReport = false
+    }
+}
+
+dependencies { coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs_nio:2.1.5' }
