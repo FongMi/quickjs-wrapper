@@ -1,0 +1,165 @@
+name: Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      spider_ref:
+        description: CatVodSpider revision for Function JAR integration
+        required: true
+        default: main
+      compare_lto:
+        description: Build matching Clang variants with and without ThinLTO
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  android:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        thin_lto: ${{ fromJSON(inputs.compare_lto && '[false, true]' || '[false]') }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          submodules: true
+          persist-credentials: false
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: gradle
+      - uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4.0.4
+      - name: Install Android tools
+        run: sdkmanager 'platforms;android-37.0' 'build-tools;37.0.0' 'ndk;29.0.14206865' 'cmake;3.22.1'
+      - name: Build Java and Android artifacts
+        shell: pwsh
+        env:
+          QUICKJS_THIN_LTO: ${{ matrix.thin_lto }}
+        run: |
+          chmod +x ./gradlew
+          ./gradlew --no-daemon verifyAndroidApi
+          if ($LASTEXITCODE) { throw 'Android API verification failed.' }
+          ./scripts/build-android.ps1 -ThinLto:($env:QUICKJS_THIN_LTO -eq 'true')
+      - name: Prepare artifacts
+        run: |
+          mkdir artifacts
+          cp build/libs/*.jar artifacts/
+          cp runtime/build/outputs/aar/runtime-release.aar artifacts/
+          cd artifacts
+          sha256sum *.jar *.aar > SHA256SUMS
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: quickjs-android${{ matrix.thin_lto && '-lto' || '' }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 3
+
+  host:
+    runs-on: windows-2025
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain: ${{ fromJSON(inputs.compare_lto && '["windows", "windows-clang", "windows-lto"]' || '["windows"]') }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          submodules: true
+          persist-credentials: false
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: gradle
+      - name: Build host JNI library
+        shell: pwsh
+        env:
+          QUICKJS_HOST_TOOLCHAIN: ${{ matrix.toolchain }}
+        run: |
+          $configure = @('-S', '.', '-B', "$env:RUNNER_TEMP/quickjs-host", '-A', 'x64')
+          if ($env:QUICKJS_HOST_TOOLCHAIN -ne 'windows') {
+            $configure += @('-T', 'ClangCL', '-DCMAKE_VS_GLOBALS=UseLldLink=true')
+          }
+          if ($env:QUICKJS_HOST_TOOLCHAIN -eq 'windows-lto') {
+            $configure += '-DQUICKJS_ENABLE_THIN_LTO=ON'
+          }
+          cmake @configure
+          if ($LASTEXITCODE) { throw 'Host JNI configuration failed.' }
+          cmake --build "$env:RUNNER_TEMP/quickjs-host" --config Release --target quickjs-wrapper --parallel 4
+          if ($LASTEXITCODE) { throw 'Host JNI build failed.' }
+          New-Item -ItemType Directory artifacts | Out-Null
+          Copy-Item "$env:RUNNER_TEMP/quickjs-host/Release/quickjs-wrapper.dll" artifacts/
+          Get-FileHash artifacts/* -Algorithm SHA256 |
+            ForEach-Object { $_.Hash.ToLowerInvariant() + '  ' + (Split-Path -Leaf $_.Path) } |
+            Set-Content artifacts/SHA256SUMS
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: quickjs-host-${{ matrix.toolchain }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 3
+
+  integration:
+    needs: android
+    runs-on: windows-2025
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: FongMi/CatVodSpider
+          ref: ${{ inputs.spider_ref }}
+          path: CatVodSpider
+          persist-credentials: false
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4.0.4
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: quickjs-android
+          path: wrapper-artifacts
+      - name: Install Android tools
+        shell: pwsh
+        run: |
+          sdkmanager 'platforms;android-37.0' 'build-tools;37.0.0'
+          if ($LASTEXITCODE) { throw 'Android SDK installation failed.' }
+      - name: Build Function JAR
+        shell: pwsh
+        run: |
+          Copy-Item wrapper-artifacts/wrapper-java-0.1.0-SNAPSHOT.jar CatVodSpider/app/libs/quickjs-api.jar
+          $sdk = [IO.Compression.ZipFile]::Open((Resolve-Path CatVodSpider/app/libs/catvod-api.jar), 'Update')
+          try {
+            @($sdk.Entries | Where-Object { $_.FullName.StartsWith('com/fongmi/quickjs/') }) |
+              ForEach-Object { $_.Delete() }
+          } finally { $sdk.Dispose() }
+          Push-Location CatVodSpider
+          try {
+            ./gradlew.bat --no-daemon spiderJar
+            if ($LASTEXITCODE) { throw 'Function JAR build failed.' }
+          } finally { Pop-Location }
+      - name: Prepare integration artifacts
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory artifacts | Out-Null
+          Copy-Item CatVodSpider/app/libs/catvod-api.jar artifacts/
+          Copy-Item CatVodSpider/app/libs/quickjs-api.jar artifacts/
+          Copy-Item CatVodSpider/jar/custom_spider.jar* artifacts/
+          Get-FileHash artifacts/* -Algorithm SHA256 |
+            ForEach-Object { $_.Hash.ToLowerInvariant() + '  ' + (Split-Path -Leaf $_.Path) } |
+            Set-Content artifacts/SHA256SUMS
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: quickjs-spider-sdk
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 3

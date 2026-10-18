@@ -19,6 +19,11 @@ tasks.withType(JavaCompile).configureEach {
     options.release = 17
 }
 
+tasks.register('verifyAndroidApi') {
+    group = 'verification'
+    description = 'Check wrapper sources against the TV Android API and desugaring contract.'
+    dependsOn ':androidApi:lintDebug'
+}
 publishing {
     publications {
         javaApi(MavenPublication) {
