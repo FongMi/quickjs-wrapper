@@ -8,10 +8,10 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-option(QUICKJS_ENABLE_THIN_LTO "Enable Android ThinLTO for performance experiments" OFF)
+option(QUICKJS_ENABLE_THIN_LTO "Enable ThinLTO with a Clang toolchain" OFF)
 
 include(CheckCSourceCompiles)
-if(MSVC)
+if(CMAKE_C_COMPILER_ID STREQUAL "MSVC")
     set(CMAKE_REQUIRED_FLAGS "/experimental:c11atomics")
 endif()
 check_c_source_compiles("#include <stdatomic.h>
@@ -40,7 +40,10 @@ target_include_directories(quickjs-core PUBLIC "${QUICKJS_SOURCE}")
 target_compile_definitions(quickjs-core PRIVATE QUICKJS_NG_BUILD _GNU_SOURCE)
 
 if(MSVC)
-    target_compile_options(quickjs-core PRIVATE /experimental:c11atomics /J)
+    if(CMAKE_C_COMPILER_ID STREQUAL "MSVC")
+        target_compile_options(quickjs-core PRIVATE /experimental:c11atomics)
+    endif()
+    target_compile_options(quickjs-core PRIVATE /J)
     target_compile_definitions(quickjs-core PRIVATE
         WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0601
         _CRT_SECURE_NO_WARNINGS _CRT_NONSTDC_NO_DEPRECATE
@@ -59,12 +62,14 @@ set_target_properties(quickjs-wrapper PROPERTIES
 target_link_libraries(quickjs-wrapper PRIVATE quickjs-core)
 
 if(QUICKJS_ENABLE_THIN_LTO)
-    if(NOT ANDROID OR NOT CMAKE_C_COMPILER_ID MATCHES "Clang")
-        message(FATAL_ERROR "ThinLTO requires the Android Clang toolchain")
+    if(NOT CMAKE_C_COMPILER_ID MATCHES "Clang")
+        message(FATAL_ERROR "ThinLTO requires a Clang toolchain")
     endif()
     target_compile_options(quickjs-core PRIVATE -flto=thin)
     target_compile_options(quickjs-wrapper PRIVATE -flto=thin)
-    target_link_options(quickjs-wrapper PRIVATE -flto=thin)
+    if(NOT MSVC)
+        target_link_options(quickjs-wrapper PRIVATE -flto=thin)
+    endif()
 endif()
 
 if(ANDROID)

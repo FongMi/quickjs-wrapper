@@ -15,6 +15,10 @@ dependencyResolutionManagement {
 }
 
 rootProject.name = 'quickjs-wrapper'
+if (gradle.startParameter.taskNames.any { it.tokenize(':').last() == 'verifyAndroidApi' }) {
+    include ':androidApi'
+    project(':androidApi').projectDir = file('checks/android-api')
+}
 if (providers.gradleProperty('androidRuntime').getOrElse('false').toBoolean()) include ':runtime'
 
 if (file('tests/settings.gradle').isFile()) apply from: 'tests/settings.gradle'
