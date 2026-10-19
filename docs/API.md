@@ -67,6 +67,23 @@ restore action must not throw. `Callback.callDetached` omits its birth scope
 while keeping delivery cancelable. TV uses these boundaries for invocation
 attribution and shared cache isolation.
 
+`setAsyncScopeCapture(capture)` also captures an `AsyncScope` when a Promise
+reaction, `await` continuation or other job is registered. Each job enters its
+own captured context, then restores the previous context. This follows the
+waiting caller even when a timer or an unscoped host future resolves the
+Promise. Install this capture before starting host invocations: its initial
+snapshot supplies the detached context for FinalizationRegistry cleanup jobs.
+Cleanup admission does not call Java or allocate context objects during GC.
+Independent callbacks still start independent calls. Capture must not
+execute JavaScript; enter and restore must not throw. A failed enter or restore
+fails pending calls with the original error and closes the runtime.
+
+The engine keeps WeakRef constructor and successful deref targets alive through
+the current synchronous execution and its microtask checkpoint. The wrapper
+calls `JS_ClearKeptObjects` at the outer native boundary after draining jobs
+and during terminal cleanup. Later turns may collect the targets; deref does
+not promise collection at a particular time.
+
 ## Cancellation, deadlines and close
 
 Canceling a call future interrupts its associated native JavaScript execution.

@@ -29,6 +29,11 @@ The native runtime compiles only `dtoa.c`, `libregexp.c`, `libunicode.c` and
 - Resolve imported/re-exported module bindings by their final identity, and
   complete asynchronous module state and rejection propagation in order.
 - Correct typed-array `with` conversion after resize and BigInt locale formatting.
+- Keep WeakRef constructor and successful deref targets alive through the current
+  job until the embedding clears kept objects after its microtask checkpoint.
+- Expose captured registration context for Promise jobs and an explicit
+  no-context boundary for FinalizationRegistry cleanup. The wrapper enters and
+  restores host scopes around these jobs.
 
 The pinned engine uses a context-based `JSInterruptHandler`, uncatchable
 OOM/InternalError exceptions and bytecode version 29. See [Java API](docs/API.md)

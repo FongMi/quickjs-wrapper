@@ -37,12 +37,13 @@ TV loads the runtime through the `QuickJS` library-loader callback and checks
 profile `fongmi-quickjs-ng-0.17-v15`. Keep Java, JS assets and JNI matched.
 The QuickJS module consumes the JAR; the runtime build consumes the AAR.
 
-Global's scoped `bindAsync` bindings enter the captured Invocation around
-Promise settlement and the complete native job drain, then restore the previous
-context. Successive awaits keep ownership. Shared cache producers use their
-own Invocation: canceling the first consumer must not cancel another consumer's
-producer. Background cache completions, socket events and timers have detached
-lifetimes. Site destruction still closes site-owned producers and streams.
+Global supplies Invocation scopes through `setAsyncScopeCapture` and scoped
+`bindAsync`. Promise/await jobs retain registration context across
+timer waits, restoring the previous context afterward. Shared cache producers
+have independent Invocations; canceling one consumer must preserve others.
+Background cache work, sockets and timers have detached lifetimes, while
+awaiting callers retain their own context. Site destruction closes its
+producers and streams.
 
 TV delegates module bytecode storage to `ModuleBytecodeCache` and supplies its
 directory, namespace, ABI and size limits. The wrapper validates engine headers;
