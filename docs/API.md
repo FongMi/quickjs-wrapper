@@ -88,6 +88,8 @@ Primitives use direct JNI conversion. Structured values use JSON or explicit
 references. Carrier records install one own writable/enumerable/configurable
 property into a parsed JSON metadata object; nulls, arrays and nonobject
 metadata are rejected.
+Java object arrays and generated key arrays also define their own indexed
+properties, without invoking setters inherited from Array.prototype.
 
 | Java value | JavaScript value |
 | --- | --- |
