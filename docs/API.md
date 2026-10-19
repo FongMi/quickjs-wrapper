@@ -145,6 +145,10 @@ I/O failures are reported through `diagnostic`; invalid entries become misses.
 the cache. Cache only trusted bytecode.
 Cache hook or decode/link failure closes the runtime: partial module
 registration cannot safely roll back.
+The native module loader accepts `import data from './data.json' with {type:'json'}`
+and dynamic import with the same type attribute. ModuleLoader.load supplies raw
+JSON text; it becomes the default export and does not use the JavaScript bytecode
+cache. Unknown attributes/types and invalid JSON fail the import.
 The wrapper bytecode header is v4; foreign or older caches must be regenerated
 from source. The pinned engine bytecode version is 29. Persist and execute
 only trusted bytecode.
