@@ -1,148 +1,59 @@
-# TV crawler integration
+# TV integration
 
 | Responsibility | Owner |
 | --- | --- |
-| JavaScript execution, Promise jobs, value conversion, references and native lifetime | wrapper |
-| Console, timers, async delay scheduling and encoding | wrapper |
-| Bytecode cache storage, integrity checks and engine format | wrapper |
+| JS execution, Promise jobs, values, references and JNI lifetime | wrapper |
+| Console, timers, delay scheduling, encoding and Web APIs | wrapper |
+| Bytecode cache storage, integrity and engine format | wrapper |
 | HTTP, cookies, sessions, sockets and proxy streams | TV |
-| Invocation attribution, site keys, host services and cache policy | TV |
-| CatVod entry points, DEX loading, module resolution, cache directory and limits | TV |
+| Sites, invocations, module resolution and cache policy | TV |
 
-HTML queries, `net` helpers and proxy results are TV APIs.
+## Artifacts
 
-## Artifact handoff
+Use one successful Actions run and verify `SHA256SUMS`.
 
-Use one successful wrapper run and verify `SHA256SUMS`:
-
-| Producer file | Consumer path |
+| Producer | Consumer |
 | --- | --- |
-| `wrapper-java-0.1.0-SNAPSHOT.jar` | `TV/quickjs/libs/wrapper-java.jar` |
-| `runtime-release.aar` | `TV/quickjs/libs/runtime-release.aar` |
-| The same Java API JAR | `CatVodSpider/app/libs/quickjs-api.jar` |
+| Java API JAR | `TV/quickjs/libs/wrapper-java.jar` |
+| Native AAR | `TV/quickjs/libs/runtime-release.aar` |
+| Same Java API JAR | `CatVodSpider/app/libs/quickjs-api.jar` |
 
-The JAR contains Java classes, scripts and R8 rules. The AAR supplies native
-libraries for both ABIs without Java API classes. TV packages its Java plugin,
-JS assets and native library in a separate runtime APK.
+The JAR contains Java classes, scripts and R8 rules. The AAR contains native
+libraries for both ABIs. TV packages these with its plugin and JS assets in
+the QuickJS runtime APK. The App supplies shared CatVod, Host and network APIs.
 
-Manual runs build `spider_ref` against its committed `catvod-api.jar` and the
-same run's `quickjs-api.jar`, producing `quickjs-spider-sdk`. The job removes
-embedded wrapper classes from the CatVod SDK; it does not regenerate that SDK.
+Manual CI builds `spider_ref` against its CatVod SDK and the same run's
+QuickJS API JAR. Crawler JARs must exclude both SDK implementations.
 After shared TV API changes, export `apiJar` and update CatVodSpider first.
-Keep both SDKs separate and exclude their implementations from the crawler JAR.
 
-## Runtime and invocation ownership
+## Ownership
 
-TV loads the runtime through the `QuickJS` library-loader callback and checks
-profile `fongmi-quickjs-ng-0.17-v15`. Keep Java, JS assets and JNI matched.
-The QuickJS module consumes the JAR; the runtime build consumes the AAR.
+TV loads native code through the QuickJS loader callback and checks its
+configured compatibility ID. Keep the JAR, native library and JS assets matched.
+Engine and cache revisions are separate from host compatibility.
 
-Global supplies Invocation scopes through `setAsyncScopeCapture` and scoped
-`bindAsync`. Promise/await jobs retain registration context across
-timer waits, restoring the previous context afterward. Shared cache producers
-have independent Invocations; canceling one consumer must preserve others.
-Background cache work, sockets and timers have detached lifetimes, while
-awaiting callers retain their own context. Site destruction closes its
-producers and streams.
+TV supplies invocation scopes through `setAsyncScopeCapture` and `bindAsync`.
+Awaited work keeps its caller's scope. Shared cache producers have independent
+lifetimes, so canceling one consumer does not cancel the others.
 
-TV delegates module bytecode storage to `ModuleBytecodeCache` and supplies its
-directory, namespace, ABI and size limits. The wrapper validates engine headers;
-cache format changes do not change the host compatibility ID.
+TV supplies the bytecode cache directory, identity, ABI and limits.
+`net.sleep` uses `WebPlatform.delay`; TV cancels waits with their invocation,
+session or site. Ordinary JS timers have a separate lifetime.
 
-TV installs SpiderDebug for background rejections. See [Java API](API.md)
-for ownership and cancellation.
+TV installs Console for Logcat and SpiderDebug for background failures.
+See [Java API](API.md) and [Web APIs](WEB.md) for wrapper contracts.
 
-## HTTP and stream boundaries
+## Streams and shutdown
 
-`net.http` text bodies use `QuickJS.Text`; buffer=1 uses `QuickJS.ByteArray`
-for a signed-number Array. Both copy their values.
-`net.map(items, callback, limit=4)` fills bounded concurrency slots as work
-completes and preserves input order. HTTP errors remain values; callback
-rejection stops queued admission while active siblings retain their lifetimes.
+An invocation owns unclaimed streams. Returning a proxy stream transfers
+ownership to the server. Cancellation, disconnect and site destruction close
+the resources they own. Close chunk readers in finally; shared cache loaders
+must release streams they do not return.
 
-Stream opening completes at headers and returns metadata with a stream handle.
-An invocation owns unclaimed streams; returning or consuming a proxy result
-transfers ownership to the server. Discard, cancellation, HTTP disconnect and
-site destruction close their owned upstream resources. A successful shared
-cache loader must also release any unclaimed stream before runtime close.
+Spider destruction rejects new calls, cancels active work, bounds the JS
+destroy hook and waits for runtime cleanup. Hook failure remains visible.
+Native interruption cannot preempt blocking Java code; host I/O needs its own
+timeout. Outstanding buffer leases defer final native destruction.
 
-`net.openStream(url, options)` exposes metadata, `await read(size)` and `close()`.
-One read may be outstanding at a time; the default chunk is 64 KiB and the
-maximum is 1 MiB. Its JNI boundary uses private direct storage, while transport
-layers may still copy. Cancellation cancels the Call promptly and lets the read
-worker release the response body. The `net.stream` proxy passthrough contract
-remains separate.
-
-## Spider destruction
-
-Spider destruction is terminal and idempotent: it rejects new calls, cancels
-active work and gives the JS destroy hook five seconds, including owner-queue
-wait, execution and Promise settlement. This also applies to Host.NONE;
-ordinary calls use the host timeout. Invoke destruction outside the owner.
-
-Expiry interrupts JavaScript and cancels owned async sources. Errors and
-TimeoutException remain visible. Every path closes the runtime and awaits
-owner cleanup; concurrent callers share cleanup and preserve interruption.
-Outstanding buffer leases defer final native destruction.
-
-Return means cleanup finished, not hook success. The budget cannot preempt
-blocking Java code or transport close; host I/O needs its own finite timeout.
-
-## HTML field queries
-
-`htmlQuery(html, plan)` synchronously parses HTML into ordinary objects, one
-row array per named query. Define a plan and collect each page in one call:
-
-```js
-const VIDEO_QUERY = {
-    queries: {
-        cards: {
-            selector: ".video-card",
-            fields: {
-                title: {selector: ".title"},
-                href: {selector: "a.title", attribute: "href"},
-                image: {selector: "img", attribute: "data-src"},
-                actors: {selector: ".actors a", all: true}
-            }
-        },
-        pages: {
-            selector: ".pagination a",
-            fields: {href: {attribute: "href"}, text: {}}
-        }
-    }
-};
-
-const response = await net.http(url);
-if (response.error) throw new Error(response.error);
-if (response.code < 200 || response.code >= 300) throw new Error(`HTTP ${response.code}`);
-const {cards, pages} = htmlQuery(response.content, VIDEO_QUERY);
-const list = cards.map(row => ({
-    vod_name: (row.title ?? "").trim(),
-    vod_id: row.href ? joinUrl(url, row.href) : "",
-    vod_pic: row.image ? joinUrl(url, row.image) : "",
-    vod_actor: row.actors.map(value => (value ?? "").trim()).filter(Boolean).join(" / ")
-}));
-```
-
-Selectors follow Jsoup semantics and are parsed on each call. Adjust this
-example to the site, then trim, deduplicate and resolve URLs in JavaScript.
-
-| Option | Contract |
-| --- | --- |
-| queries | 1..16 named queries; each result is an array |
-| query.selector | Required Jsoup CSS selector for rows |
-| query.fields | 1..32 named field definitions |
-| query.maxRows | Optional integer 1..1024, default 1024; overflow throws, never truncates |
-| field.selector | Optional descendant selector; excludes the row itself. Omit to read the row |
-| field.attribute | Optional attribute name; omit for descendant text |
-| field.all | Optional boolean, default false; true returns all selected values |
-
-A query with no matched rows returns `[]`. A missing selected node/attribute produces `null`;
-an existing empty value produces `""`. An all-field with no matches produces
-`[]`, and missing attributes remain null entries. Text preserves whitespace
-and concatenates descendant text/data without inserting breaks. URLs remain
-as written; there is no automatic base URL.
-
-Input is bounded to 2,097,152 UTF-16 code units; the JSON plan to 16,384; total
-escaped JSON output across query groups to 1,048,576. Unknown options and
-invalid selectors/types throw.
+`net`, `htmlQuery` and proxy results are TV crawler APIs. Their usage belongs
+in the [CatVodSpider guide](https://github.com/FongMi/CatVodSpider/blob/main/docs/development.md).

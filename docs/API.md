@@ -1,8 +1,9 @@
-# Java runtime API
+# Java API
 
-The public API is `com.fongmi.quickjs`. Each `QuickJS` instance owns one
-executor and native runtime. Separate instances execute independently.
-JavaScript execution, callbacks and Promise jobs return to that owner.
+The API package is `com.fongmi.quickjs`. Each runtime owns one execution thread;
+JavaScript, callbacks and Promise jobs execute there.
+
+## Setup
 
 ```java
 import com.fongmi.quickjs.QuickJS;
@@ -12,237 +13,147 @@ try (QuickJS runtime = new QuickJS()) {
 }
 ```
 
-## Runtime setup
-
-`QuickJS()` calls `System.loadLibrary("quickjs-wrapper")`. Supply a `Runnable`
-loader for a runtime package or absolute DLL path. Load native code before
-calling `QuickJSContext.create()`.
+`QuickJS()` loads `quickjs-wrapper`. Supply a `Runnable` loader when native code
+comes from a separate runtime package or absolute path.
 
 | Capability | Installation |
 | --- | --- |
-| ECMAScript, Promise jobs and engine intrinsics | `new QuickJS()` |
-| Shared console and output sink | `Console.install(runtime).join()` |
-| Timers only | `new Timers(runtime, errors)` |
-| UTF-8 codecs only | `Encoding.install(runtime).join()` |
-| Module resolution and source loading | `runtime.setModuleLoader(loader).join()` |
+| Runtime | `new QuickJS()` |
+| Console | `Console.install(runtime).join()` |
+| Timers | `new Timers(runtime, errors)` |
+| UTF-8 codecs | `Encoding.install(runtime).join()` |
+| Web APIs, timers and extended codecs | `new WebPlatform(runtime, errors, baseURL)` |
+| Modules | `runtime.setModuleLoader(loader).join()` |
 
-Install helpers before application code and close timers before the runtime.
+Install helpers before application code. Close the platform or timers before
+the runtime. See [Web APIs](WEB.md) for supported capabilities.
 
-## Calls, bindings and ownership
+## Calls and bindings
 
-`evaluate`, `evaluateModule` and `invoke` unwrap returned JavaScript Promises
-into their Java futures. `reference` operations retain object and Promise
-results. Do not block the owner waiting for a future that requires an
-asynchronous callback on that owner.
-`submit` batches work on the owner; calls already there run inline. `execute`
-queues work and can establish a boundary after the current native job drain.
-References and callbacks belong to their originating runtime and must be closed.
+`evaluate`, `evaluateModule` and `invoke` return futures that await JavaScript
+Promises. `reference` and `callFunction` retain object and Promise results;
+they do not await those Promises. Release every acquired reference once.
 
-`callFunction(reference, receiver, args...)` directly invokes a retained function.
-Null selects an undefined receiver. Object and Promise results remain retained
-references, as with `reference` operations; this method does not await a Promise.
+`submit` runs on the owner and runs inline when already there. `execute` queues
+an owner turn, which can establish a boundary after the native job drain.
+Do not block the owner waiting for a callback that needs the same thread.
 
-`bind` installs a synchronous Java host function. `bindAsync` accepts a function
-returning `CompletableFuture<?>` and exposes an intrinsic JavaScript Promise:
+`bind` is synchronous. `bindAsync` accepts a cancelable future and exposes a
+JavaScript Promise:
 
 ```java
 runtime.bindAsync("read", args -> readAsync((String) args[0])).join();
-// JavaScript: const content = await read(url);
 ```
 
-The host supplies `readAsync` and its cancelable future. `bind` stays synchronous.
+Keep returned values stable until conversion finishes. Java failures reject
+the Promise; uncatchable engine errors fail the owning Java call directly.
+Canceling an unfinished call cancels its async sources. Successful calls leave
+background work detached; runtime close cancels remaining sources. Give shared
+producers separate dependent futures for each consumer.
 
-Keep results stable until queued conversion completes. Host throws, null
-futures, source failures and ordinary conversion failures reject the JavaScript
-Promise. Uncatchable engine failures fail the owning Java calls without running
-JavaScript catch handlers, including after asynchronous continuation.
-Canceling an owning pending call cancels its source futures and drops settlement;
-it does not add cancellation to JavaScript Promise. Successful callers detach
-background work, while runtime close cancels remaining sources. Shared producers
-must supply independent dependent futures for their consumers.
+Scoped `bindAsync` and `setAsyncScopeCapture` preserve host context through
+Promise settlement and jobs. Capture must not execute JS; enter/restore hooks
+must not throw. Hook failure closes the runtime. Install capture before host
+calls so finalization jobs have a detached context. `Callback.callDetached`
+delivers without its birth scope. WeakRef targets stay alive through the current
+job and its microtask checkpoint; collection in a later turn is not guaranteed.
 
-The scoped `bindAsync` overload captures an `AsyncScope` before dispatch and
-enters it around actual settlement and the complete native job drain. Its
-restore action must not throw. `Callback.callDetached` omits its birth scope
-while keeping delivery cancelable. TV uses these boundaries for invocation
-attribution and shared cache isolation.
+## Cancellation and limits
 
-`setAsyncScopeCapture(capture)` also captures an `AsyncScope` when a Promise
-reaction, `await` continuation or other job is registered. Each job enters its
-own captured context, then restores the previous context. This follows the
-waiting caller even when a timer or an unscoped host future resolves the
-Promise. Install this capture before starting host invocations: its initial
-snapshot supplies the detached context for FinalizationRegistry cleanup jobs.
-Cleanup admission does not call Java or allocate context objects during GC.
-Independent callbacks still start independent calls. Capture must not
-execute JavaScript; enter and restore must not throw. A failed enter or restore
-fails pending calls with the original error and closes the runtime.
+Canceling a call future interrupts its native JS execution. `evaluateTimed`
+and `invokeTimed` cover queue wait, execution and Promise settlement. Durations
+are milliseconds; zero disables the deadline and negative values fail.
+Native interruption cannot preempt blocking Java code, so host I/O needs a timeout.
 
-The engine keeps WeakRef constructor and successful deref targets alive through
-the current synchronous execution and its microtask checkpoint. The wrapper
-calls `JS_ClearKeptObjects` at the outer native boundary after draining jobs
-and during terminal cleanup. Later turns may collect the targets; deref does
-not promise collection at a particular time.
+`cancelPending()` cancels unfinished JS calls and leaves the runtime open.
+Later calls, generic owner work and detached jobs have separate lifetimes.
 
-## Cancellation, deadlines and close
+`close()` rejects new work, cancels pending operations and waits for owner
+cleanup. `onClose` registers cleanup that runs once. Buffer leases remain valid
+after logical close and defer final native destruction until released.
 
-Canceling a call future interrupts its associated native JavaScript execution.
-`evaluateTimed` and `invokeTimed` additionally bound owner-queue wait, synchronous
-execution and Promise settlement with one monotonic deadline. Host work should
-return cancelable futures and provide its own finite I/O timeout: native
-interruption cannot preempt an arbitrary blocking Java function.
-Timeouts are milliseconds; zero disables the deadline and negative values fail
-with `IllegalArgumentException`.
+`setLimits(memory, stack)` bounds engine storage and stack use; direct buffers
+use Java storage. A positive constructor operation limit bounds unfinished
+external calls; zero is unlimited. Excess work fails with
+`RejectedExecutionException`. Cleanup and async settlement remain available.
 
-`cancelPending()` cancels a snapshot of unfinished JavaScript calls while
-leaving the runtime open. It requests native interruption before cancellation
-continuations. Generic `submit`/`execute` work, reference release and later calls
-remain outside that snapshot. Detached jobs whose call already completed are
-outside the call's cancellation lifetime.
-
-`close()` rejects further work, cancels unfinished operations and releases
-native state on its owner. `onClose` registers cleanup that runs once, including
-when an internal failure initiates close. Outstanding buffer leases defer final
-native destruction and remain usable after logical close.
-
-## Values and binary storage
-
-Primitives use direct JNI conversion. Structured values use JSON or explicit
-references. Carrier records install one own writable/enumerable/configurable
-property into a parsed JSON metadata object; nulls, arrays and nonobject
-metadata are rejected.
-Java object arrays and generated key arrays also define their own indexed
-properties, without invoking setters inherited from Array.prototype.
+## Values and buffers
 
 | Java value | JavaScript value |
 | --- | --- |
-| `QuickJS.Json(text)` | Parsed JSON value |
-| `byte[]` | Copied `ArrayBuffer` |
-| `QuickJS.Binary(json, property, bytes)` | Metadata with an `ArrayBuffer` property |
-| `QuickJS.Text(json, property, text)` | Metadata with a Java string property |
-| `QuickJS.ByteArray(json, property, bytes)` | Metadata with a signed-number Array property |
-| `QuickJS.DirectBuffer(buffer)` | Explicit shared writable direct storage |
+| `QuickJS.Json(text)` | Parsed JSON |
+| `byte[]` | Copied ArrayBuffer |
+| `QuickJS.Binary(json, property, bytes)` | Metadata with an ArrayBuffer property |
+| `QuickJS.Text(json, property, text)` | Metadata with a string property |
+| `QuickJS.ByteArray(json, property, bytes)` | Metadata with a signed-number array |
+| `QuickJS.DirectBuffer(buffer)` | Shared writable direct storage |
 
-`Text` preserves UTF-16 code units, including NUL and lone surrogates. It copies
-the string without JSON-encoding its body. `ByteArray` preserves Java's signed
-byte convention. JavaScript `Uint8Array` reads the same bits as unsigned bytes.
-Modern ArrayBuffer/TypedArray results copy their selected byte range into
-`byte[]`; normalize a DataView to Uint8Array before returning it by value.
-Plain objects containing binary fields still follow JSON conversion.
+Metadata carriers require a JSON object and define an own data property.
+`Text` preserves UTF-16 code units. ArrayBuffer and TypedArray results copy their
+selected range to `byte[]`; convert DataView to Uint8Array before returning it.
+Nested binary fields still follow JSON conversion. Keep queued inputs stable.
 
-Do not mutate or reuse Java input while its queued conversion is pending.
-Ordinary ByteBuffer values do not implicitly opt into shared storage.
-`DirectBuffer` captures a fixed slice of the buffer's remaining range. Java and
-JavaScript require exclusive turns; a future can complete before its native
-Promise-job drain, so queue an `execute` barrier before reusing shared storage.
-Detached background work must also have stopped using it. Callers must not
-unmap or free the Java-managed backing allocation while JavaScript retains it.
+`DirectBuffer` captures the buffer's remaining slice. Java and JS need exclusive
+turns. Queue an `execute` barrier before Java reuses shared storage, and stop
+detached JS work first. Keep the backing allocation alive while JS retains it.
+Ordinary ByteBuffer values do not opt into shared storage.
 
-`reference("evaluateReference", source, name, module)` retains a JavaScript
-buffer reference. `leaseBuffer(reference)` pins the exact ArrayBuffer,
-TypedArray or DataView range. `BufferLease.use(reader)` supplies a read-only
-direct view during a short owner callback; do not retain that view or wait for
-owner work inside the callback. Close the lease after use. Detach, transfer and
-logical runtime close cannot free pinned bytes; resizing to a different
-allocation size is rejected while pinned. This does not permit concurrent
-JavaScript writes or references shared across runtimes.
+`leaseBuffer(reference)` pins an ArrayBuffer or view range. `BufferLease.use`
+provides a read-only direct view during a short owner callback. Do not retain
+that view or wait for owner work inside the callback. Close the lease after use;
+incompatible resize is rejected while pinned. Views are not shared across runtimes.
 
-## Modules, language and resource limits
+## Modules and bytecode
 
 `QuickJS.ModuleLoader` supplies `normalize(base, name)`, `load(name)` and optional
-`url(name)` for `import.meta.url`. Hooks run on the owner and must not reenter
-JavaScript. Filesystem, CLI, `std` and `os` services belong to the host.
+`url(name)` for import.meta.url. Hooks run on the owner and must not reenter JS.
+JSON imports use the `type: 'json'` attribute; the loader supplies raw JSON text.
 
 `ModuleBytecodeCache(directory, identity, maxBytes, maxFiles, diagnostic)` stores
-source-aware module bytecode with integrity and engine-header checks. Supply a
-host namespace and ABI in `identity`, and a private cache directory. Entries are
-limited to 4 MiB; the host supplies total-byte and file-count limits. Recoverable
-I/O failures are reported through `diagnostic`; invalid entries become misses.
-`cacheBytecode()` enables the loader hooks; delegate their load/store methods to
-the cache. Cache only trusted bytecode.
-Cache hook or decode/link failure closes the runtime: partial module
-registration cannot safely roll back.
-The native module loader accepts `import data from './data.json' with {type:'json'}`
-and dynamic import with the same type attribute. ModuleLoader.load supplies raw
-JSON text; it becomes the default export and does not use the JavaScript bytecode
-cache. Unknown attributes/types and invalid JSON fail the import.
-The wrapper bytecode header is v4; foreign or older caches must be regenerated
-from source. The pinned engine bytecode version is 29. Persist and execute
-only trusted bytecode.
+source-aware bytecode with integrity and engine checks. Supply a private directory,
+host namespace and ABI. Entries are limited to 4 MiB. Enable `cacheBytecode()`
+and delegate the loader's load/store hooks to the cache. I/O failures go to
+`diagnostic`; invalid entries become misses. Store and execute only trusted,
+matching-engine bytecode.
+Cache-hook or decode/link failures close the runtime because partial module
+registration cannot safely roll back. Regenerate incompatible caches from source.
 
-Use a matched JAR/native library; the host owns selection and profile checks.
-`setCodeGenerationAllowed(false)` rejects string eval and Function constructors
-with EvalError. Its default is true. Nonstring eval, host evaluation, module
-imports and trusted bytecode remain available. This policy is not a sandbox.
+`setCodeGenerationAllowed(false)` rejects string eval and Function constructors.
+Host evaluation and imports remain available. This setting is not a sandbox.
 
-The engine includes Uint8Array Base64/Hex codecs. Encoding installs UTF-8
-TextEncoder/TextDecoder with fatal/BOM/streaming options; other charset labels,
-encoding streams and Intl are unsupported. Selected tests do not establish full
-ECMAScript conformance. `setLimits(memory, stack)` controls engine budgets;
-direct storage uses Java's budget. Engine OOM/InternalError bypass JavaScript
-catch handlers; ordinary Java host exceptions become catchable JavaScript Errors.
+## Timers and console
 
-`new QuickJS(32)` or `new QuickJS(loader, 32)` limits unfinished external
-operations. Zero is the unlimited default; negative limits fail before loading
-native code. Capacity includes queued, executing and Promise-waiting calls,
-public submissions and lease readers. Excess work fails with
-`RejectedExecutionException` before side effects; the producer is not blocked.
-Completion releases capacity at the returned future boundary. Owned async
-settlements, timer delivery and resource cleanup remain available at capacity.
-This is an operation limit, not a bound on all internal work or total memory.
+`Timers` installs setTimeout/setInterval and their clear methods. Timers retain
+callback references and run independently of the call that created them.
+They support callback arguments, string handlers and JS delay conversion.
+Intervals rearm after the synchronous callback; they do not await its Promise.
+Nested timers use the standard minimum delay.
 
-## Timers, console and background failures
+`Timers.delay(ms)` returns a cancelable future completed on the owner.
+`WebPlatform.delay(ms)` uses its installed scheduler. Cancellation removes the
+task; helper or runtime close cancels pending delays.
 
-```java
-import com.fongmi.quickjs.Console;
-import com.fongmi.quickjs.QuickJS;
-import com.fongmi.quickjs.Timers;
+Console supports log/debug/info/warn/error, assert, dir/dirxml, count/countReset,
+time/timeLog/timeEnd, trace, groups, table and clear. Its default sink uses
+Android Logcat or desktop stdout/stderr. Pass a `BiConsumer<String, String>`
+to replace it.
 
-try (QuickJS runtime = new QuickJS();
-     Timers timers = new Timers(runtime, Throwable::printStackTrace)) {
-    Console.install(runtime, (level, message) -> System.out.println(message)).join();
-    runtime.evaluate("new Promise(resolve => setTimeout(() => resolve(42), 0))").join();
-}
-```
+`setUnhandledRejectionListener` reports background failures after the job drain.
+Awaited failures go to their call future. Register a handler in the same turn
+to suppress a background report; leave the listener unset to disable reporting.
 
-`Timers.delay(milliseconds)` returns a cancelable `CompletableFuture<Void>` using
-the same scheduler. Completion runs on the runtime owner; cancellation removes
-the scheduled task. Closing the helper or runtime cancels pending delays.
+## Function JAR API
 
-Timers retain callback references and start fresh invocations, detached from
-the call that created them. Close the helper before the runtime. Cleanup
-cancels timers, frees bindings and preserves globals replaced by user code.
-Console supplies log/debug/info/warn/error and replaceable stdout/print, while
-preserving a custom global formatter. Its sink runs on the owner.
+`QuickJSContext`, `JSObject`, `JSArray`, `JSFunction` and `JSMethod` share the
+runtime and native library. Compile Function JARs against the matching API JAR.
 
-`setUnhandledRejectionListener` reports background rejections at a completed
-job-drain boundary. It is disabled by default. A handler attached in the same
-turn suppresses reporting; awaited failures go to their call future without
-duplicate notification. Diagnostic conversion does not invoke accessors,
-Proxy traps or arbitrary `toString`. A listener may release resources, queue
-work or close the runtime; synchronous JavaScript reentry fails explicitly.
+Load native code before `QuickJSContext.create()`. A created context owns its
+runtime; a context wrapping an existing runtime releases only its own values
+and callbacks. Synchronous evaluation retains Promise objects without awaiting them.
 
-## Synchronous Function JAR API
-
-`QuickJSContext`, `JSObject`, `JSArray`, `JSFunction` and `JSMethod` are in
-`com.fongmi.quickjs` and share the same runtime and native library as `QuickJS`.
-Compile Function JARs against the matching QuickJS API JAR.
-`QuickJSContext.create()` expects native loading to be complete and owns its
-runtime. A context constructed from an existing runtime releases only its own
-references and callbacks on close. Synchronous facade calls dispatch to the
-owner; owner reentry runs inline. Synchronous evaluation returns a retained
-JavaScript Promise object rather than awaiting it as the modern API does.
-
-Objects/functions retain references and receivers; `hold`/`release` manage
-acquisitions. Returning a JSObject from a JSCallFunction transfers one
-acquisition to JavaScript. Byte arrays become ArrayBuffers; typed arrays remain
-JSObjects. `toMap`/`toArray` preserve cycles and shared children.
-`getPointer()` is an opaque identity rather than an external native address.
-`toMap` and `toArray` traverse the complete graph in one owner submission,
-including supplied map creators and filters. Function creators receive the
-context and function identity; receiver retention belongs to the context.
-`createNewJSArray(values...)` creates an array in one conversion. Map conversion
-uses a Java key snapshot rather than a temporary facade array. Custom creators
-must return a fresh wrapper for each acquisition. Diagnostic object records
-are unordered snapshots; identity and receiver tracking do not depend on equals.
-Console formatting uses compact JSON with cycle markers.
+Objects retain references and receivers; balance `hold` and `release`.
+Returning a JSObject from JSCallFunction transfers one acquisition to JS.
+Byte arrays become ArrayBuffers; typed arrays remain JSObjects.
+`toMap`/`toArray` preserve cycles and shared children in one owner turn.
+Custom creators must return a fresh wrapper for each acquisition.
+`getPointer()` is an opaque identity, not a native pointer.
