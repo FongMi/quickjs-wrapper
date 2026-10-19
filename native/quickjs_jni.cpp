@@ -83,6 +83,7 @@ struct Runtime {
     jclass json_class, binary_class, text_class, byte_array_class, direct_buffer_class, callback_class, reference_class, transfer_class;
     jfieldID direct_buffer_data;
     jmethodID dispatch_method, dispatch_async_method, complete_method, rejection_method, normalize_method, load_method, load_bytecode_method;
+    jmethodID uncatchable_method;
     jmethodID load_source_bytecode_method, store_bytecode_method, module_failed_method, module_url_method;
     bool module_cache = false;
     jmethodID boolean_value, integer_value, double_value, bigint_constructor;
@@ -212,9 +213,15 @@ std::string js_error(Runtime *rt, JSValueConst error) {
     return result;
 }
 
-std::string take_error(Runtime *rt) {
+struct ScriptError {
+    std::string message;
+    bool uncatchable = false;
+};
+
+ScriptError take_error(Runtime *rt) {
     JSValue error = JS_GetException(rt->context);
-    std::string result = js_error(rt, error);
+    bool uncatchable = JS_IsUncatchableError(error);
+    ScriptError result{js_error(rt, error), uncatchable};
     JS_FreeValue(rt->context, error);
     return result;
 }
@@ -303,6 +310,12 @@ JSValue java_error(Runtime *rt) {
     JNIEnv *env = rt->env;
     jthrowable error = env->ExceptionOccurred();
     env->ExceptionClear();
+    bool uncatchable = env->CallBooleanMethod(rt->owner, rt->uncatchable_method, error);
+    if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+        env->DeleteLocalRef(error);
+        return JS_ThrowInternalError(rt->context, "Cannot inspect Java exception");
+    }
     jclass type = env->GetObjectClass(error);
     jmethodID method = env->GetMethodID(type, "toString", "()Ljava/lang/String;");
     auto text = static_cast<jstring>(env->CallObjectMethod(error, method));
@@ -318,6 +331,7 @@ JSValue java_error(Runtime *rt) {
         JS_FreeValue(rt->context, result);
         return JS_EXCEPTION;
     }
+    if (uncatchable) JS_SetUncatchableError(rt->context, result);
     return JS_Throw(rt->context, result);
 }
 
@@ -685,11 +699,11 @@ JSValue from_java(Runtime *rt, jobject value, int depth) {
     return JS_ThrowTypeError(ctx, "Unsupported Java argument type");
 }
 
-void complete(Runtime *rt, jlong id, JSValueConst value, const std::string *error = nullptr, bool references = false, bool buffers = false) {
+void complete(Runtime *rt, jlong id, JSValueConst value, const ScriptError *error = nullptr, bool references = false, bool buffers = false) {
     JNIEnv *env = rt->env;
     Conversion conversion(rt);
     jobject result = nullptr;
-    std::string conversion_error;
+    ScriptError conversion_error;
     if (!error) {
         result = references ? to_reference(rt, value, buffers) : to_java(rt, value);
         if (env->ExceptionCheck()) {
@@ -703,10 +717,11 @@ void complete(Runtime *rt, jlong id, JSValueConst value, const std::string *erro
     }
     jstring message = nullptr;
     if (error) {
-        message = new_string(env, error->data(), error->size());
+        message = new_string(env, error->message.data(), error->message.size());
     }
     if (!env->ExceptionCheck()) {
-        jboolean accepted = env->CallBooleanMethod(rt->owner, rt->complete_method, id, result, message);
+        jboolean accepted = env->CallBooleanMethod(rt->owner, rt->complete_method, id, result, message,
+                                                  static_cast<jboolean>(error && error->uncatchable));
         if (!env->ExceptionCheck()) conversion.committed = accepted && !error;
     }
     if (result) env->DeleteLocalRef(result);
@@ -714,14 +729,15 @@ void complete(Runtime *rt, jlong id, JSValueConst value, const std::string *erro
 }
 
 void throw_script_error(Runtime *rt) {
-    std::string error = take_error(rt);
-    jstring message = new_string(rt->env, error.data(), error.size());
+    ScriptError error = take_error(rt);
+    jstring message = new_string(rt->env, error.message.data(), error.message.size());
     if (!message) return;
     jclass type = rt->env->FindClass("com/fongmi/quickjs/QuickJS$ScriptException");
     if (type) {
-        jmethodID constructor = rt->env->GetMethodID(type, "<init>", "(Ljava/lang/String;)V");
+        jmethodID constructor = rt->env->GetMethodID(type, "<init>", "(Ljava/lang/String;Z)V");
         if (constructor) {
-            auto exception = static_cast<jthrowable>(rt->env->NewObject(type, constructor, message));
+            auto exception = static_cast<jthrowable>(rt->env->NewObject(type, constructor, message,
+                                                                       static_cast<jboolean>(error.uncatchable)));
             if (exception) {
                 rt->env->Throw(exception);
                 rt->env->DeleteLocalRef(exception);
@@ -739,7 +755,7 @@ JSValue settled(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv,
     if (JS_ToInt64(ctx, &id, data[0])) return JS_EXCEPTION;
     JSValueConst value = argc ? argv[0] : JS_UNDEFINED;
     if (rejected) {
-        std::string error = js_error(rt, value);
+        ScriptError error{js_error(rt, value), JS_IsUncatchableError(value)};
         complete(rt, id, JS_UNDEFINED, &error);
     } else complete(rt, id, value);
     return JS_UNDEFINED;
@@ -748,7 +764,7 @@ JSValue settled(JSContext *ctx, JSValueConst, int argc, JSValueConst *argv,
 void result(Runtime *rt, jlong id, JSValue value) {
     JSContext *ctx = rt->context;
     if (JS_IsException(value)) {
-        std::string error = take_error(rt);
+        ScriptError error = take_error(rt);
         complete(rt, id, JS_UNDEFINED, &error);
         return;
     }
@@ -765,7 +781,7 @@ void result(Runtime *rt, jlong id, JSValue value) {
         JS_FreeValue(ctx, functions[0]);
         JS_FreeValue(ctx, functions[1]);
         if (JS_IsException(chained)) {
-            std::string error = take_error(rt);
+            ScriptError error = take_error(rt);
             complete(rt, id, JS_UNDEFINED, &error);
         }
         JS_FreeValue(ctx, chained);
@@ -797,8 +813,13 @@ void drain(Runtime *rt, jlong id) {
     while (!rt->stopping.load(std::memory_order_relaxed) && JS_IsJobPending(rt->runtime)) {
         if (rt->env->ExceptionCheck()) break;
         if (JS_ExecutePendingJob(rt->runtime, &ctx) < 0) {
-            std::string error = take_error(rt);
+            ScriptError error = take_error(rt);
+            // Completing a Java future may synchronously reenter this runtime.
+            auto owners = rt->executing;
             complete(rt, id, JS_UNDEFINED, &error);
+            if (error.uncatchable) {
+                for (jlong owner : owners) if (owner && owner != id) complete(rt, owner, JS_UNDEFINED, &error);
+            }
             break;
         }
     }
@@ -1032,7 +1053,7 @@ void fail_module(Runtime *rt) {
     JSValue error = JS_GetException(rt->context);
     JS_SetUncatchableError(rt->context, error);
     JS_Throw(rt->context, JS_DupValue(rt->context, error));
-    std::string message = take_error(rt);
+    ScriptError message = take_error(rt);
     JS_Throw(rt->context, error);
     rt->env->CallVoidMethod(rt->owner, rt->module_failed_method);
     if (rt->env->ExceptionCheck()) java_error(rt);
@@ -1403,7 +1424,8 @@ extern "C" JNIEXPORT jlong JNICALL Java_com_fongmi_quickjs_QuickJS_create(JNIEnv
     jclass type = env->GetObjectClass(owner);
     rt->dispatch_method = method(rt, type, "dispatch", "(I[Ljava/lang/Object;)Ljava/lang/Object;");
     rt->dispatch_async_method = method(rt, type, "dispatchAsync", "(I[Ljava/lang/Object;Lcom/fongmi/quickjs/QuickJS$Callback;Lcom/fongmi/quickjs/QuickJS$Callback;)V");
-    rt->complete_method = method(rt, type, "complete", "(JLjava/lang/Object;Ljava/lang/String;)Z");
+    rt->complete_method = method(rt, type, "complete", "(JLjava/lang/Object;Ljava/lang/String;Z)Z");
+    rt->uncatchable_method = method(rt, type, "isUncatchable", "(Ljava/lang/Throwable;)Z");
     rt->rejection_method = method(rt, type, "unhandledRejection", "(Ljava/lang/String;)V");
     rt->normalize_method = method(rt, type, "normalize", "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;");
     rt->load_method = method(rt, type, "load", "(Ljava/lang/String;)Ljava/lang/String;");
@@ -1515,7 +1537,7 @@ extern "C" JNIEXPORT void JNICALL Java_com_fongmi_quickjs_QuickJS_reference(
         : arguments(rt, objects, values) ? reference_operation(rt, name, values, objects) : JS_EXCEPTION;
     for (JSValue argument : values) JS_FreeValue(rt->context, argument);
     if (JS_IsException(value)) {
-        std::string error = take_error(rt);
+        ScriptError error = take_error(rt);
         complete(rt, call, JS_UNDEFINED, &error);
     } else complete(rt, call, value, nullptr, name != "keys" && name != "memory" && name != "resources", name == "evaluateReference");
     JS_FreeValue(rt->context, value);
