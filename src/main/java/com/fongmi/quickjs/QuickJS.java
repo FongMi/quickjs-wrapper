@@ -407,6 +407,13 @@ public final class QuickJS implements AutoCloseable {
         return call((handle, callId) -> invoke(handle, callId, objectName, method, values));
     }
 
+    /** Calls a retained function with an explicit receiver, retaining object and Promise results. */
+    public CompletableFuture<Object> callFunction(Reference function, Object receiver, Object... args) {
+        Objects.requireNonNull(function, "function");
+        Object[] values = Objects.requireNonNull(args, "args").clone();
+        return call((handle, callId) -> callFunction(handle, callId, function, receiver, values));
+    }
+
     /** Runs owner-thread hooks around the native call and its Promise jobs. */
     public CompletableFuture<Object> invoke(String objectName, String method,
             Consumer<CompletableFuture<Object>> before, Runnable after, Object... args) {
@@ -502,7 +509,7 @@ public final class QuickJS implements AutoCloseable {
 
     /**
      * Performs an object operation without JSON conversion or implicit Promise unwrapping.
-     * Supported operations are global, receiver, evaluate, get, set, has, hasOwn, call, stringify, keys,
+     * Supported operations are global, receiver, evaluate, get, set, has, hasOwn, stringify, keys,
      * parse, newObject, newArray, dup, free, compile, execute, gc, memory, memoryUsed,
      * memoryLimit, stackLimit and gcThreshold.
      * Compile and execute use this wrapper's versioned QuickJS-NG bytecode; execute accepts
@@ -642,6 +649,28 @@ public final class QuickJS implements AutoCloseable {
     /** Executes immediately on the owner thread, or queues work from any other thread. */
     public <T> CompletableFuture<T> submit(Callable<T> work) {
         return schedule(work, true, false);
+    }
+
+    <T> T runOnOwner(Callable<T> work) {
+        if (!isOwnerThread()) return submit(work).join();
+        try {
+            synchronized (lifecycle) {
+                if (closed) throw new RuntimeClosedException();
+            }
+            if (inModuleHook || moduleFailed) throw new IllegalStateException("Owner reentry during module initialization");
+            T value = work.call();
+            synchronized (lifecycle) {
+                if (moduleFailed) throw new IllegalStateException("Module initialization failed; runtime is closing");
+                if (closed) throw new RuntimeClosedException();
+            }
+            return value;
+        } catch (CompletionException | CancellationException error) {
+            throw error;
+        } catch (Throwable error) {
+            throw new CompletionException(error);
+        } finally {
+            if (moduleFailed) close();
+        }
     }
 
     /** Queues work even when called from a host function on the owner thread. */
@@ -1157,6 +1186,8 @@ public final class QuickJS implements AutoCloseable {
     private native void evaluate(long handle, long callId, String source, String name, boolean module);
 
     private native void invoke(long handle, long callId, String objectName, String method, Object[] args);
+
+    private native void callFunction(long handle, long callId, Reference function, Object receiver, Object[] args);
 
     private native void callback(long handle, long callId, long callbackId, Object[] args, boolean detached);
 

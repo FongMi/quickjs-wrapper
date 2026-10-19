@@ -34,7 +34,7 @@ Keep both SDKs separate and exclude their implementations from the crawler JAR.
 ## Runtime and invocation ownership
 
 TV loads the runtime through the `QuickJS` library-loader callback and checks
-profile `fongmi-quickjs-ng-0.17-v13`. Keep Java, JS assets and JNI matched.
+profile `fongmi-quickjs-ng-0.17-v15`. Keep Java, JS assets and JNI matched.
 The QuickJS module consumes the JAR; the runtime build consumes the AAR.
 
 Global's scoped `bindAsync` bindings enter the captured Invocation around
