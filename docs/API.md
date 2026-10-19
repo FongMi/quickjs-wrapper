@@ -49,7 +49,9 @@ runtime.bindAsync("read", args -> readAsync((String) args[0])).join();
 The host supplies `readAsync` and its cancelable future. `bind` stays synchronous.
 
 Keep results stable until queued conversion completes. Host throws, null
-futures, source failures and conversion failures reject the JavaScript Promise.
+futures, source failures and ordinary conversion failures reject the JavaScript
+Promise. Uncatchable engine failures fail the owning Java calls without running
+JavaScript catch handlers, including after asynchronous continuation.
 Canceling an owning pending call cancels its source futures and drops settlement;
 it does not add cancellation to JavaScript Promise. Successful callers detach
 background work, while runtime close cancels remaining sources. Shared producers
