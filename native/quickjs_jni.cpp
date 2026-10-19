@@ -1110,11 +1110,57 @@ JSValue compile_module(Runtime *rt, jstring name, jstring source, const std::str
     return compiled;
 }
 
-JSModuleDef *load(JSContext *ctx, const char *name, void *opaque) {
+int check_import_attributes(JSContext *ctx, void *, JSValueConst attributes) {
+    if (JS_IsUndefined(attributes)) return 0;
+    JSPropertyEnum *properties;
+    uint32_t length;
+    if (JS_GetOwnPropertyNames(ctx, &properties, &length, attributes, JS_GPN_ENUM_ONLY | JS_GPN_STRING_MASK) < 0)
+        return -1;
+    int result = 0;
+    for (uint32_t i = 0; i < length; ++i) {
+        size_t size;
+        const char *key = JS_AtomToCStringLen(ctx, &size, properties[i].atom);
+        if (!key) {
+            result = -1;
+            break;
+        }
+        if (size != 4 || memcmp(key, "type", 4) != 0) {
+            JS_ThrowTypeError(ctx, "Unsupported import attribute: %s", key);
+            result = -1;
+        }
+        JS_FreeCString(ctx, key);
+        if (result < 0) break;
+    }
+    JS_FreePropertyEnum(ctx, properties, length);
+    return result;
+}
+
+int import_type(JSContext *ctx, JSValueConst attributes) {
+    if (JS_IsUndefined(attributes)) return 0;
+    JSValue value = JS_GetPropertyStr(ctx, attributes, "type");
+    if (JS_IsException(value)) return -1;
+    if (JS_IsUndefined(value)) return 0;
+    size_t length;
+    const char *type = JS_ToCStringLen(ctx, &length, value);
+    JS_FreeValue(ctx, value);
+    if (!type) return -1;
+    int result = length == 4 && memcmp(type, "json", 4) == 0 ? 1 : -1;
+    if (result < 0) JS_ThrowTypeError(ctx, "Unsupported module type: %s", type);
+    JS_FreeCString(ctx, type);
+    return result;
+}
+
+int initialize_json_module(JSContext *ctx, JSModuleDef *module) {
+    return JS_SetModuleExport(ctx, module, "default", JS_GetModulePrivateValue(ctx, module));
+}
+
+JSModuleDef *load(JSContext *ctx, const char *name, void *opaque, JSValueConst attributes) {
     auto rt = static_cast<Runtime *>(opaque);
     JNIEnv *env = rt->env;
+    int type = import_type(ctx, attributes);
+    if (type < 0) return nullptr;
     jstring module = new_string(env, name, strlen(name));
-    auto bytecode = env->ExceptionCheck() ? nullptr
+    auto bytecode = env->ExceptionCheck() || type != 0 ? nullptr
         : static_cast<jbyteArray>(env->CallObjectMethod(rt->owner, rt->load_bytecode_method, module));
     if (env->ExceptionCheck()) {
         env->DeleteLocalRef(module);
@@ -1149,6 +1195,28 @@ JSModuleDef *load(JSContext *ctx, const char *name, void *opaque) {
         return nullptr;
     }
     std::string source = utf8(env, string);
+    if (type == 1) {
+        env->DeleteLocalRef(string);
+        env->DeleteLocalRef(module);
+        if (env->ExceptionCheck()) {
+            java_error(rt);
+            return nullptr;
+        }
+        JSValue value = JS_ParseJSON(ctx, source.c_str(), source.size(), name);
+        if (JS_IsException(value)) return nullptr;
+        JSModuleDef *result = JS_NewCModule(ctx, name, initialize_json_module);
+        if (!result) {
+            JS_FreeValue(ctx, value);
+            return nullptr;
+        }
+        if (JS_AddModuleExport(ctx, result, "default") < 0) {
+            JS_FreeValue(ctx, value);
+            fail_module(rt);
+            return nullptr;
+        }
+        JS_SetModulePrivateValue(ctx, result, value);
+        return result;
+    }
     JSValue compiled = env->ExceptionCheck() ? java_error(rt) : compile_module(rt, module, string, name, source);
     env->DeleteLocalRef(string);
     env->DeleteLocalRef(module);
@@ -1496,7 +1564,7 @@ extern "C" JNIEXPORT jlong JNICALL Java_com_fongmi_quickjs_QuickJS_create(JNIEnv
     }
     JS_SetContextOpaque(rt->context, rt);
     JS_SetInterruptHandler(rt->runtime, interrupted, rt);
-    JS_SetModuleLoaderFunc(rt->runtime, normalize, load, rt);
+    JS_SetModuleLoaderFunc2(rt->runtime, normalize, load, check_import_attributes, rt);
     JSValue global = JS_GetGlobalObject(rt->context);
     JSValue promise = JS_GetPropertyStr(rt->context, global, "Promise");
     JSValue prototype = JS_GetPropertyStr(rt->context, promise, "prototype");
