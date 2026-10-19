@@ -15,6 +15,7 @@ import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledFuture;
@@ -282,8 +283,15 @@ public final class QuickJS implements AutoCloseable {
     }
 
     public static final class ScriptException extends RuntimeException {
+        private final boolean uncatchable;
+
         public ScriptException(String message) {
+            this(message, false);
+        }
+
+        private ScriptException(String message, boolean uncatchable) {
             super(message);
+            this.uncatchable = uncatchable;
         }
     }
 
@@ -959,6 +967,10 @@ public final class QuickJS implements AutoCloseable {
             if (error != null) {
                 Throwable failure = error;
                 while (failure instanceof CompletionException && failure.getCause() != null) failure = failure.getCause();
+                if (isUncatchable(failure)) {
+                    for (long owner : owners.keySet()) complete(owner, null, failure);
+                    return;
+                }
                 String message = failure.toString();
                 call((handle, callId) -> settle(handle, callId, operation.reject.id, message, calls, true)).join();
             }
@@ -978,15 +990,21 @@ public final class QuickJS implements AutoCloseable {
         if (value instanceof Object[] items) for (Object item : items) validateAsyncValue(item, depth + 1);
     }
 
+    private boolean isUncatchable(Throwable error) {
+        while ((error instanceof CompletionException || error instanceof ExecutionException || error instanceof QuickJSException)
+                && error.getCause() != null) error = error.getCause();
+        return error instanceof ScriptException script && script.uncatchable;
+    }
+
     private static void discard(Object value) {
         if (value instanceof Reference reference) reference.close();
         else if (value instanceof Callback callback) callback.close();
         else if (value instanceof Object[] items) for (Object item : items) discard(item);
     }
 
-    private boolean complete(long callId, Object value, String error) {
+    private boolean complete(long callId, Object value, String error, boolean uncatchable) {
         if (moduleFailed && error == null) error = "Module initialization failed; runtime is closing";
-        boolean accepted = complete(callId, value, error == null ? null : new ScriptException(error));
+        boolean accepted = complete(callId, value, error == null ? null : new ScriptException(error, uncatchable));
         return accepted && error == null;
     }
 
