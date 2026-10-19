@@ -2,6 +2,7 @@
 #include <quickjs.h>
 #include "buffer_lease.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstring>
@@ -63,6 +64,7 @@ struct Runtime {
     JSValue host_receiver = JS_UNDEFINED;
     std::unordered_map<jlong, Callback> callbacks;
     std::unordered_map<jlong, size_t> callback_origins;
+    std::unordered_map<jlong, size_t> job_origins;
     std::unordered_map<jlong, Reference> references;
     std::unordered_map<void *, jlong> identities;
     std::unordered_map<void *, JSValue> rejections;
@@ -85,6 +87,9 @@ struct Runtime {
     jfieldID direct_buffer_data;
     jmethodID dispatch_method, dispatch_async_method, complete_method, rejection_method, normalize_method, load_method, load_bytecode_method;
     jmethodID uncatchable_method;
+    JSClassID job_scope_class = 0;
+    bool job_scopes_enabled = false;
+    jmethodID capture_job_scope, enter_job_scope, leave_job_scope;
     jmethodID load_source_bytecode_method, store_bytecode_method, module_failed_method, module_url_method;
     bool module_cache = false;
     jmethodID boolean_value, integer_value, double_value, bigint_constructor;
@@ -810,27 +815,129 @@ int interrupted(JSContext *, void *opaque) {
 void retire_cancellations(Runtime *rt) {
     std::lock_guard<std::mutex> lock(rt->cancel_mutex);
     for (auto iterator = rt->canceled.begin(); iterator != rt->canceled.end();) {
-        bool retained = *iterator > rt->last_call || rt->callback_origins.count(*iterator);
+        bool retained = *iterator > rt->last_call || rt->callback_origins.count(*iterator)
+                        || rt->job_origins.count(*iterator);
         for (jlong call : rt->executing) retained |= call == *iterator;
         if (retained) ++iterator;
         else iterator = rt->canceled.erase(iterator);
     }
 }
 
+struct JobScope {
+    jobject value;
+    jlong origin;
+    std::vector<jlong> owners;
+};
+
+void free_job_scope(JSRuntime *runtime, JSValueConst value) {
+    auto rt = static_cast<Runtime *>(JS_GetRuntimeOpaque(runtime));
+    auto scope = static_cast<JobScope *>(JS_GetOpaque(value, rt->job_scope_class));
+    if (!scope) return;
+    delete_global_ref(rt->env, scope->value);
+    for (jlong owner : scope->owners) {
+        auto found = rt->job_origins.find(owner);
+        if (found != rt->job_origins.end() && --found->second == 0) rt->job_origins.erase(found);
+    }
+    delete scope;
+}
+
+JSValue capture_job_scope(JSContext *ctx, void *opaque) {
+    auto rt = static_cast<Runtime *>(opaque);
+    jobject captured = rt->env->CallObjectMethod(rt->owner, rt->capture_job_scope);
+    if (rt->env->ExceptionCheck()) return java_error(rt);
+    JSValue value = JS_NewObjectProtoClass(ctx, JS_NULL, rt->job_scope_class);
+    if (JS_IsException(value)) {
+        rt->env->DeleteLocalRef(captured);
+        return value;
+    }
+    auto scope = new (std::nothrow) JobScope{nullptr, rt->active, {}};
+    if (!scope) {
+        rt->env->DeleteLocalRef(captured);
+        JS_FreeValue(ctx, value);
+        return JS_ThrowOutOfMemory(ctx);
+    }
+    scope->value = new_global_ref(rt->env, captured);
+    rt->env->DeleteLocalRef(captured);
+    if (!scope->value) {
+        delete scope;
+        JS_FreeValue(ctx, value);
+        return rt->env->ExceptionCheck() ? java_error(rt) : JS_ThrowOutOfMemory(ctx);
+    }
+    size_t retained = 0;
+    try {
+        scope->owners = rt->executing;
+        if (scope->origin && std::find(scope->owners.begin(), scope->owners.end(), scope->origin) == scope->owners.end())
+            scope->owners.push_back(scope->origin);
+        std::sort(scope->owners.begin(), scope->owners.end());
+        scope->owners.erase(std::unique(scope->owners.begin(), scope->owners.end()), scope->owners.end());
+        for (jlong owner : scope->owners) {
+            ++rt->job_origins[owner];
+            ++retained;
+        }
+    } catch (const std::bad_alloc &) {
+        for (size_t i = 0; i < retained; ++i) {
+            auto found = rt->job_origins.find(scope->owners[i]);
+            if (--found->second == 0) rt->job_origins.erase(found);
+        }
+        delete_global_ref(rt->env, scope->value);
+        delete scope;
+        JS_FreeValue(ctx, value);
+        return JS_ThrowOutOfMemory(ctx);
+    }
+    JS_SetOpaque(value, scope);
+    return value;
+}
+
 void drain(Runtime *rt, jlong id) {
     JSContext *ctx;
     while (!rt->stopping.load(std::memory_order_relaxed) && JS_IsJobPending(rt->runtime)) {
         if (rt->env->ExceptionCheck()) break;
-        if (JS_ExecutePendingJob(rt->runtime, &ctx) < 0) {
-            ScriptError error = take_error(rt);
-            // Completing a Java future may synchronously reenter this runtime.
-            auto owners = rt->executing;
-            complete(rt, id, JS_UNDEFINED, &error);
-            if (error.uncatchable) {
-                for (jlong owner : owners) if (owner && owner != id) complete(rt, owner, JS_UNDEFINED, &error);
-            }
+        JSValue context = JS_GetPendingJobContextValue(rt->runtime);
+        auto scope = static_cast<JobScope *>(JS_GetOpaque(context, rt->job_scope_class));
+        bool scoped = scope || rt->job_scopes_enabled;
+        jlong previous = rt->active;
+        std::vector<jlong> previous_owners;
+        jobject restore = nullptr;
+        if (scoped) {
+            previous_owners.swap(rt->executing);
+            if (scope) rt->executing.swap(scope->owners);
+            rt->active = scope ? scope->origin : 0;
+            restore = rt->env->CallObjectMethod(rt->owner, rt->enter_job_scope, scope ? scope->value : nullptr);
+        }
+        int status = rt->env->ExceptionCheck() ? -1 : JS_ExecutePendingJob(rt->runtime, &ctx);
+        jlong origin = scope ? scope->origin : id;
+        if (restore) {
+            jthrowable failure = rt->env->ExceptionOccurred();
+            if (failure) rt->env->ExceptionClear();
+            rt->env->CallVoidMethod(rt->owner, rt->leave_job_scope, restore, failure);
+            if (failure) rt->env->DeleteLocalRef(failure);
+            rt->env->DeleteLocalRef(restore);
+        }
+        if (scoped) {
+            if (scope) rt->executing.swap(scope->owners);
+            rt->executing.swap(previous_owners);
+            rt->active = previous;
+        }
+        if (rt->env->ExceptionCheck()) {
+            JS_FreeValue(rt->context, context);
             break;
         }
+        if (status < 0) {
+            ScriptError error = take_error(rt);
+            // Completing a Java future may synchronously reenter this runtime.
+            const auto &owners = scope ? scope->owners : rt->executing;
+            size_t count = owners.size();
+            complete(rt, origin, JS_UNDEFINED, &error);
+            if (error.uncatchable) {
+                for (size_t i = 0; i < count; ++i) {
+                    jlong owner = owners[i];
+                    if (owner && owner != origin) complete(rt, owner, JS_UNDEFINED, &error);
+                }
+            }
+            JS_FreeValue(rt->context, context);
+            break;
+        }
+        JS_FreeValue(rt->context, context);
     }
 }
 
@@ -850,11 +957,20 @@ struct Entry {
     }
     ~Entry() {
         if (rt->depth == 1) {
-            if (!rt->stopping.load(std::memory_order_relaxed)) drain(rt, id);
+            if (!rt->stopping.load(std::memory_order_relaxed)) {
+                do {
+                    drain(rt, id);
+                    if (rt->env->ExceptionCheck()) break;
+                    JS_ClearKeptObjects(rt->runtime);
+                } while (!rt->stopping.load(std::memory_order_relaxed)
+                         && !rt->env->ExceptionCheck() && JS_IsJobPending(rt->runtime));
+            }
             if (rt->stopping.load(std::memory_order_relaxed)) {
+                JS_SetJobContextCapture(rt->runtime, nullptr, nullptr);
                 clear_rejections(rt);
                 do {
                     JS_DiscardPendingJobs(rt->runtime);
+                    JS_ClearKeptObjects(rt->runtime);
                     JS_RunGC(rt->runtime);
                 } while (JS_IsJobPending(rt->runtime));
             } else if (!rt->rejections.empty() && !JS_IsJobPending(rt->runtime) && !rt->env->ExceptionCheck()) notify_rejections(rt);
@@ -1244,6 +1360,7 @@ jmethodID method(Runtime *rt, jclass type, const char *name, const char *signatu
 }
 
 void destroy(Runtime *rt) {
+    if (rt->runtime) JS_SetJobContextCapture(rt->runtime, nullptr, nullptr);
     if (rt->context) {
         clear_rejections(rt);
         for (auto &entry : rt->callbacks) JS_FreeValue(rt->context, entry.second.function);
@@ -1495,6 +1612,9 @@ extern "C" JNIEXPORT jlong JNICALL Java_com_fongmi_quickjs_QuickJS_create(JNIEnv
     rt->dispatch_async_method = method(rt, type, "dispatchAsync", "(I[Ljava/lang/Object;Lcom/fongmi/quickjs/QuickJS$Callback;Lcom/fongmi/quickjs/QuickJS$Callback;)V");
     rt->complete_method = method(rt, type, "complete", "(JLjava/lang/Object;Ljava/lang/String;Z)Z");
     rt->uncatchable_method = method(rt, type, "isUncatchable", "(Ljava/lang/Throwable;)Z");
+    rt->capture_job_scope = method(rt, type, "captureJobScope", "()Lcom/fongmi/quickjs/QuickJS$AsyncScope;");
+    rt->enter_job_scope = method(rt, type, "enterJobScope", "(Lcom/fongmi/quickjs/QuickJS$AsyncScope;)Ljava/lang/Runnable;");
+    rt->leave_job_scope = method(rt, type, "leaveJobScope", "(Ljava/lang/Runnable;Ljava/lang/Throwable;)V");
     rt->rejection_method = method(rt, type, "unhandledRejection", "(Ljava/lang/String;)V");
     rt->normalize_method = method(rt, type, "normalize", "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;");
     rt->load_method = method(rt, type, "load", "(Ljava/lang/String;)Ljava/lang/String;");
@@ -1563,6 +1683,17 @@ extern "C" JNIEXPORT jlong JNICALL Java_com_fongmi_quickjs_QuickJS_create(JNIEnv
         return 0;
     }
     JS_SetContextOpaque(rt->context, rt);
+    JS_SetRuntimeOpaque(rt->runtime, rt);
+    JS_NewClassID(rt->runtime, &rt->job_scope_class);
+    JSClassDef job_scope_definition{};
+    job_scope_definition.class_name = "HostJobScope";
+    job_scope_definition.finalizer = free_job_scope;
+    if (JS_NewClass(rt->runtime, rt->job_scope_class, &job_scope_definition) < 0) {
+        JS_ThrowOutOfMemory(rt->context);
+        throw_script_error(rt);
+        destroy(rt);
+        return 0;
+    }
     JS_SetInterruptHandler(rt->runtime, interrupted, rt);
     JS_SetModuleLoaderFunc2(rt->runtime, normalize, load, check_import_attributes, rt);
     JSValue global = JS_GetGlobalObject(rt->context);
@@ -1594,6 +1725,14 @@ extern "C" JNIEXPORT void JNICALL Java_com_fongmi_quickjs_QuickJS_rejections(
     rt->env = env;
     JS_SetHostPromiseRejectionTracker(rt->runtime, enabled ? track_rejection : nullptr, rt);
     clear_rejections(rt);
+}
+
+extern "C" JNIEXPORT void JNICALL Java_com_fongmi_quickjs_QuickJS_jobScopes(
+    JNIEnv *env, jobject, jlong handle, jboolean enabled) {
+    Runtime *rt = get(handle);
+    rt->env = env;
+    rt->job_scopes_enabled = enabled;
+    JS_SetJobContextCapture(rt->runtime, enabled ? capture_job_scope : nullptr, rt);
 }
 
 extern "C" JNIEXPORT void JNICALL Java_com_fongmi_quickjs_QuickJS_reference(

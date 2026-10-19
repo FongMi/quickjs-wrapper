@@ -1,8 +1,9 @@
 package com.fongmi.quickjs;
 
-import java.nio.ByteBuffer;
 import java.lang.ref.PhantomReference;
 import java.lang.ref.ReferenceQueue;
+import java.net.URI;
+import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -37,6 +38,7 @@ import java.util.function.Supplier;
 public final class QuickJS implements AutoCloseable {
 
     private static final class Deadlines {
+
         private static final ScheduledThreadPoolExecutor TIMER = timer();
 
         private static ScheduledThreadPoolExecutor timer() {
@@ -52,6 +54,7 @@ public final class QuickJS implements AutoCloseable {
 
     /** A JSON value parsed by the runtime when passed to JavaScript. */
     public record Json(String text) {
+
         public Json {
             Objects.requireNonNull(text, "text");
         }
@@ -59,6 +62,7 @@ public final class QuickJS implements AutoCloseable {
 
     /** A JSON object with one property replaced by an ArrayBuffer. */
     public record Binary(String json, String property, byte[] bytes) {
+
         public Binary {
             Objects.requireNonNull(json, "json");
             Objects.requireNonNull(property, "property");
@@ -68,6 +72,7 @@ public final class QuickJS implements AutoCloseable {
 
     /** A JSON object with one own data property replaced by an unescaped string. */
     public record Text(String json, String property, String text) {
+
         public Text {
             Objects.requireNonNull(json, "json");
             Objects.requireNonNull(property, "property");
@@ -81,6 +86,7 @@ public final class QuickJS implements AutoCloseable {
      * conversion copies their values into the Array.
      */
     public record ByteArray(String json, String property, byte[] bytes) {
+
         public ByteArray {
             Objects.requireNonNull(json, "json");
             Objects.requireNonNull(property, "property");
@@ -95,33 +101,41 @@ public final class QuickJS implements AutoCloseable {
      * no longer uses the buffer. Returning a JS buffer to Java still creates byte[].
      */
     public record DirectBuffer(ByteBuffer buffer) {
+
         public DirectBuffer {
             Objects.requireNonNull(buffer, "buffer");
             if (!buffer.isDirect() || buffer.isReadOnly()) throw new IllegalArgumentException("Buffer must be direct and writable");
             buffer = buffer.slice();
         }
 
-        @Override public ByteBuffer buffer() { return buffer.duplicate(); }
+        @Override
+        public ByteBuffer buffer() {
+            return buffer.duplicate();
+        }
     }
 
     @FunctionalInterface
     public interface Function {
+
         Object call(Object... args) throws Exception;
     }
 
     /** Returns an owned, cancelable future; its value must remain stable until conversion. */
     @FunctionalInterface
     public interface AsyncFunction {
+
         CompletableFuture<?> call(Object... args) throws Exception;
     }
 
     /** Enters a captured owner-thread context; returns its nonthrowing restore hook. */
     @FunctionalInterface
     public interface AsyncScope {
+
         Runnable enter();
     }
 
     public interface ModuleLoader {
+
         String normalize(String base, String name);
 
         String load(String name);
@@ -131,17 +145,23 @@ public final class QuickJS implements AutoCloseable {
          * Must not synchronously reenter this runtime. Initialization failure is
          * terminal because a registered engine module cannot be rolled back.
          */
-        default String url(String name) { return null; }
+        default String url(String name) {
+            return null;
+        }
 
         default byte[] loadBytecode(String name) {
             return null;
         }
 
         /** Opt in once when installed; old loaders do not pay serialization costs. */
-        default boolean cacheBytecode() { return false; }
+        default boolean cacheBytecode() {
+            return false;
+        }
 
         /** Source-aware cache for trusted, matching-engine bytes. Null is a miss. */
-        default byte[] loadBytecode(String name, String source) { return null; }
+        default byte[] loadBytecode(String name, String source) {
+            return null;
+        }
 
         /**
          * Stores the already compiled module. Classify recoverable I/O failures in
@@ -155,6 +175,7 @@ public final class QuickJS implements AutoCloseable {
 
     /** An owned reference to a JavaScript object; each acquisition must be released once. */
     public static final class Reference implements AutoCloseable {
+
         private final QuickJS runtime;
         private final long id;
         private final String kind;
@@ -191,6 +212,7 @@ public final class QuickJS implements AutoCloseable {
      * A lease remains usable after runtime close and delays native destruction.
      */
     public static final class BufferLease implements AutoCloseable {
+
         private final BufferCleanup cleanup;
 
         private BufferLease(QuickJS runtime, long id) {
@@ -202,10 +224,14 @@ public final class QuickJS implements AutoCloseable {
             return cleanup.runtime.useBuffer(this, Objects.requireNonNull(reader, "reader"));
         }
 
-        @Override public void close() { cleanup.close(); }
+        @Override
+        public void close() {
+            cleanup.close();
+        }
     }
 
     private static final class BufferReaper {
+
         private static final ReferenceQueue<BufferLease> QUEUE = new ReferenceQueue<>();
         private static final Set<BufferCleanup> LIVE = ConcurrentHashMap.newKeySet();
         static {
@@ -225,6 +251,7 @@ public final class QuickJS implements AutoCloseable {
     }
 
     private static final class BufferCleanup extends PhantomReference<BufferLease> {
+
         private final QuickJS runtime;
         private final long id;
         private boolean closed;
@@ -235,11 +262,14 @@ public final class QuickJS implements AutoCloseable {
             this.id = id;
         }
 
-        private void close() { runtime.closeBuffer(this); }
+        private void close() {
+            runtime.closeBuffer(this);
+        }
     }
 
     /** Transfers one retained reference to JavaScript when returned by a host function. */
     public record Transfer(Reference value) {
+
         public Transfer {
             Objects.requireNonNull(value, "value");
         }
@@ -247,6 +277,7 @@ public final class QuickJS implements AutoCloseable {
 
     /** A JavaScript function retained by this runtime until explicitly closed. */
     public static final class Callback implements AutoCloseable {
+
         private final QuickJS runtime;
         private final long id;
         private boolean closed;
@@ -283,6 +314,7 @@ public final class QuickJS implements AutoCloseable {
     }
 
     public static final class ScriptException extends RuntimeException {
+
         private final boolean uncatchable;
 
         public ScriptException(String message) {
@@ -296,13 +328,19 @@ public final class QuickJS implements AutoCloseable {
     }
 
     static final class RuntimeClosedException extends IllegalStateException {
-        private RuntimeClosedException() { super("Runtime is closed"); }
+
+        private RuntimeClosedException() {
+            super("Runtime is closed");
+        }
     }
 
     @FunctionalInterface
     private interface Operation {
+
         void run(long handle, long callId);
     }
+
+    private record AsyncBinding(AsyncFunction function, Supplier<AsyncScope> capture) {}
 
     private static final AtomicInteger NEXT_RUNTIME = new AtomicInteger();
     private final Object lifecycle = new Object();
@@ -312,7 +350,6 @@ public final class QuickJS implements AutoCloseable {
     private final Map<Long, CompletableFuture<Object>> pending = new HashMap<>();
     private final Set<Long> cleanupCalls = new HashSet<>();
     private final Map<Integer, Function> functions = new HashMap<>();
-    private record AsyncBinding(AsyncFunction function, Supplier<AsyncScope> capture) {}
     private final Map<Integer, AsyncBinding> asyncFunctions = new HashMap<>();
     private final Map<Long, AsyncCall> asyncCalls = new HashMap<>();
     private Map<Long, CompletableFuture<Object>> asyncOwners = Map.of();
@@ -322,6 +359,10 @@ public final class QuickJS implements AutoCloseable {
     private final CompletableFuture<Void> destroyed = new CompletableFuture<>();
     private volatile Thread ownerThread;
     private ModuleLoader moduleLoader;
+    private Supplier<AsyncScope> asyncScopeCapture;
+    private AsyncScope detachedJobScope;
+    private boolean inJobScope;
+    private boolean capturingJobScope;
     private Consumer<ScriptException> unhandledRejectionListener;
     private boolean reportingRejection;
     private boolean inModuleHook;
@@ -541,7 +582,10 @@ public final class QuickJS implements AutoCloseable {
                     releaseBuffer(handle, id);
                     throw error;
                 }
-                synchronized (lifecycle) { bufferLeases++; }
+
+                synchronized (lifecycle) {
+                    bufferLeases++;
+                }
                 if (!result.complete(lease)) lease.close();
             }
             return null;
@@ -615,13 +659,77 @@ public final class QuickJS implements AutoCloseable {
      * unaffected; this is a code-generation policy, not a sandbox boundary.
      */
     public CompletableFuture<Void> setCodeGenerationAllowed(boolean allowed) {
-        return submit(() -> { codeGeneration(handle, allowed); return null; });
+        return submit(() -> {
+            codeGeneration(handle, allowed);
+            return null;
+        });
     }
 
     /** Runs owned resource cleanup once on logical close, before native destruction. */
     public CompletableFuture<Void> onClose(Runnable cleanup) {
         Objects.requireNonNull(cleanup, "cleanup");
-        return submit(() -> { closeHooks.add(cleanup); return null; });
+        return submit(() -> {
+            closeHooks.add(cleanup);
+            return null;
+        });
+    }
+
+    public CompletableFuture<Void> setAsyncScopeCapture(Supplier<AsyncScope> capture) {
+        return submit(() -> {
+            AsyncScope detached = capture == null ? null : captureJobScope(capture);
+            jobScopes(handle, capture != null);
+            asyncScopeCapture = capture;
+            detachedJobScope = detached;
+            return null;
+        });
+    }
+
+    private AsyncScope captureJobScope() {
+        return captureJobScope(asyncScopeCapture);
+    }
+
+    private AsyncScope captureJobScope(Supplier<AsyncScope> capture) {
+        capturingJobScope = true;
+        try {
+            return Objects.requireNonNull(capture.get(), "Async scope is null");
+        } finally {
+            capturingJobScope = false;
+        }
+    }
+
+    private Runnable enterJobScope(AsyncScope scope) {
+        boolean previous = inJobScope;
+        inJobScope = true;
+        try {
+            AsyncScope context = scope == null ? detachedJobScope : scope;
+            Runnable restore = Objects.requireNonNull(context.enter(), "Async restore hook is null");
+            return () -> {
+                try {
+                    restore.run();
+                } finally {
+                    inJobScope = previous;
+                }
+            };
+        } catch (Throwable error) {
+            inJobScope = previous;
+            failAsyncContext(error);
+            throw error;
+        }
+    }
+
+    private void leaveJobScope(Runnable restore, Throwable failure) throws Throwable {
+        try {
+            restore.run();
+        } catch (Throwable error) {
+            if (failure == null) failure = error;
+            else if (failure != error) failure.addSuppressed(error);
+            failAsyncContext(failure);
+        }
+        if (failure != null) throw failure;
+    }
+
+    private void failAsyncContext(Throwable error) {
+        close(error);
     }
 
     /**
@@ -657,6 +765,7 @@ public final class QuickJS implements AutoCloseable {
             synchronized (lifecycle) {
                 if (closed) throw new RuntimeClosedException();
             }
+            if (capturingJobScope) throw new IllegalStateException("JavaScript reentry from async context capture");
             if (inModuleHook || moduleFailed) throw new IllegalStateException("Owner reentry during module initialization");
             T value = work.call();
             synchronized (lifecycle) {
@@ -684,7 +793,10 @@ public final class QuickJS implements AutoCloseable {
 
     /** Delivery/cleanup for work already owned by this package, never a new admission. */
     CompletableFuture<Void> continueOnOwner(Runnable work, boolean inline) {
-        return schedule(() -> { work.run(); return null; }, inline, true);
+        return schedule(() -> {
+            work.run();
+            return null;
+        }, inline, true);
     }
 
     public boolean isOwnerThread() {
@@ -783,6 +895,7 @@ public final class QuickJS implements AutoCloseable {
     }
 
     private static final class PendingOperation implements Runnable {
+
         private Runnable task;
         private final CompletableFuture<?> result;
 
@@ -791,9 +904,13 @@ public final class QuickJS implements AutoCloseable {
             this.result = result;
         }
 
-        @Override public void run() {
-            try { task.run(); }
-            finally { task = null; }
+        @Override
+        public void run() {
+            try {
+                task.run();
+            } finally {
+                task = null;
+            }
         }
     }
 
@@ -815,6 +932,7 @@ public final class QuickJS implements AutoCloseable {
     private CompletableFuture<Object> call(Operation operation,
             Consumer<CompletableFuture<Object>> before, Runnable after, boolean cleanup, long timeoutMillis) {
         if (timeoutMillis < 0) throw new IllegalArgumentException("Timeout must be nonnegative");
+        if (isOwnerThread() && capturingJobScope) return failedFuture(new IllegalStateException("JavaScript reentry from async context capture"));
         if (isOwnerThread() && reportingRejection && !cleanup) return failedFuture(new IllegalStateException("JavaScript reentry from a rejection listener"));
         if (isOwnerThread() && (inModuleHook || moduleFailed) && !cleanup) return failedFuture(new IllegalStateException("JavaScript reentry during module initialization"));
         CompletableFuture<Object> result = new CompletableFuture<>();
@@ -826,62 +944,71 @@ public final class QuickJS implements AutoCloseable {
             callId = ++nextCallId;
             pending.put(callId, result);
             if (cleanup) cleanupCalls.add(callId);
-            result.whenComplete((value, error) -> {
-                ArrayList<AsyncCall> canceled = null;
-                boolean cancel = result.isCancelled() || error instanceof TimeoutException;
-                synchronized (lifecycle) {
-                    pending.remove(callId);
-                    cleanupCalls.remove(callId);
-                    timedOutCalls.remove(callId);
-                    if (cancel && handle != 0) interrupt(handle, callId);
-                    if (!asyncCalls.isEmpty()) for (Iterator<AsyncCall> iterator = asyncCalls.values().iterator(); iterator.hasNext(); ) {
-                        AsyncCall asynchronous = iterator.next();
-                        if (asynchronous.owners.remove(callId) == null || !cancel || asynchronous.settling) continue;
-                        iterator.remove();
-                        if (canceled == null) canceled = new ArrayList<>();
-                        canceled.add(asynchronous);
-                    }
-                }
-                if (canceled != null) cancelAsync(canceled);
-            });
-            task = () -> {
-                synchronized (lifecycle) {
-                    if (closed || result.isDone() || timedOutCalls.contains(callId)) return;
-                }
-                try {
-                    try {
-                        if (before != null) before.accept(result);
-                        if (!result.isDone()) operation.run(handle, callId);
-                    } finally {
-                        try {
-                            if (after != null) after.run();
-                        } finally {
-                            if (moduleFailed) close();
-                        }
-                    }
-                } catch (Throwable error) {
-                    complete(callId, null, error);
-                }
-            };
+            result.whenComplete((value, error) -> onCallComplete(callId, result, error));
+            task = () -> executeCall(callId, result, operation, before, after);
             runInline = isOwnerThread() && !reportingRejection;
             Runnable queued = runInline || cleanup ? task : admit(task, result);
             if (queued == null) return result;
-            if (timeoutMillis > 0) {
-                long id = callId;
-                ScheduledFuture<?> deadline = Deadlines.TIMER.schedule(() -> {
-                    synchronized (lifecycle) {
-                        if (result.isDone()) return;
-                        timedOutCalls.add(id);
-                        if (handle != 0) interrupt(handle, id);
-                    }
-                    result.completeExceptionally(new TimeoutException("JavaScript call exceeded " + timeoutMillis + " ms"));
-                }, timeoutMillis, TimeUnit.MILLISECONDS);
-                result.whenComplete((value, error) -> deadline.cancel(false));
-            }
+            if (timeoutMillis > 0) scheduleDeadline(callId, result, timeoutMillis);
             if (!runInline) executor.execute(queued);
         }
         if (runInline) task.run();
         return result;
+    }
+
+    private void onCallComplete(long callId, CompletableFuture<Object> result, Throwable error) {
+        ArrayList<AsyncCall> canceled = null;
+        boolean cancelSources = result.isCancelled() || error instanceof TimeoutException;
+        synchronized (lifecycle) {
+            pending.remove(callId);
+            cleanupCalls.remove(callId);
+            timedOutCalls.remove(callId);
+            if (cancelSources && handle != 0) interrupt(handle, callId);
+            if (!asyncCalls.isEmpty()) {
+                for (Iterator<AsyncCall> iterator = asyncCalls.values().iterator(); iterator.hasNext(); ) {
+                    AsyncCall asynchronous = iterator.next();
+                    if (asynchronous.owners.remove(callId) == null || !cancelSources || asynchronous.settling) continue;
+                    iterator.remove();
+                    if (canceled == null) canceled = new ArrayList<>();
+                    canceled.add(asynchronous);
+                }
+            }
+        }
+        if (canceled != null) cancelAsync(canceled);
+    }
+
+    private void executeCall(long callId, CompletableFuture<Object> result, Operation operation, Consumer<CompletableFuture<Object>> before, Runnable after) {
+        synchronized (lifecycle) {
+            if (closed || result.isDone() || timedOutCalls.contains(callId)) return;
+        }
+        try {
+            try {
+                if (before != null) before.accept(result);
+                if (!result.isDone()) operation.run(handle, callId);
+            } finally {
+                try {
+                    if (after != null) after.run();
+                } finally {
+                    if (moduleFailed) close();
+                }
+            }
+        } catch (Throwable error) {
+            complete(callId, null, error);
+        }
+    }
+
+    private void scheduleDeadline(long callId, CompletableFuture<Object> result, long timeoutMillis) {
+        ScheduledFuture<?> deadline = Deadlines.TIMER.schedule(() -> onCallTimeout(callId, result, timeoutMillis), timeoutMillis, TimeUnit.MILLISECONDS);
+        result.whenComplete((value, error) -> deadline.cancel(false));
+    }
+
+    private void onCallTimeout(long callId, CompletableFuture<Object> result, long timeoutMillis) {
+        synchronized (lifecycle) {
+            if (result.isDone()) return;
+            timedOutCalls.add(callId);
+            if (handle != 0) interrupt(handle, callId);
+        }
+        result.completeExceptionally(new TimeoutException("JavaScript call exceeded " + timeoutMillis + " ms"));
     }
 
     private Object dispatch(int id, Object[] args) throws Exception {
@@ -895,9 +1022,11 @@ public final class QuickJS implements AutoCloseable {
     }
 
     private final class AsyncCall {
+
         private final long id = ++nextAsyncId;
         private final Map<Long, CompletableFuture<Object>> owners;
-        private final Callback resolve, reject;
+        private final Callback resolve;
+        private final Callback reject;
         private CompletableFuture<?> source;
         private AsyncScope scope = () -> () -> {};
         private boolean settling;
@@ -916,35 +1045,10 @@ public final class QuickJS implements AutoCloseable {
 
     private void dispatchAsync(int id, Object[] args, Callback resolve, Callback reject) {
         if (!isOwnerThread()) throw new IllegalStateException("Async host called outside owner thread");
-        AsyncCall operation;
-        synchronized (lifecycle) {
-            if (closed) throw new RuntimeClosedException();
-            long[] nativeOwners = scope(handle);
-            Map<Long, CompletableFuture<Object>> owners = new HashMap<>();
-            for (CompletableFuture<?> owner : asyncOwners.values()) {
-                if (owner.isCancelled()) throw new CancellationException("JavaScript call canceled");
-            }
-            for (long call : nativeOwners) {
-                CompletableFuture<Object> owner = pending.get(call);
-                if (owner != null && owner.isCancelled()) throw new CancellationException("JavaScript call canceled");
-                if (owner != null && !owner.isDone()) owners.put(call, owner);
-            }
-            for (Map.Entry<Long, CompletableFuture<Object>> owner : asyncOwners.entrySet()) {
-                if (pending.get(owner.getKey()) == owner.getValue() && !owner.getValue().isDone()) owners.put(owner.getKey(), owner.getValue());
-            }
-            operation = new AsyncCall(owners, resolve, reject);
-            asyncCalls.put(operation.id, operation);
-        }
+        AsyncCall operation = registerAsyncCall(resolve, reject);
         CompletableFuture<?> source;
         try {
-            AsyncBinding binding = asyncFunctions.get(id);
-            if (binding == null) {
-                discard(args);
-                throw new IllegalStateException("Unknown async host function: " + id);
-            }
-            try { operation.scope = Objects.requireNonNull(binding.capture.get(), "Async scope is null"); }
-            catch (Throwable error) { discard(args); throw error; }
-            source = Objects.requireNonNull(binding.function.call(args), "Async host returned a null future");
+            source = invokeAsyncBinding(id, args, operation);
         } catch (Throwable error) {
             source = failedFuture(error);
         }
@@ -958,10 +1062,50 @@ public final class QuickJS implements AutoCloseable {
         source.whenComplete((value, error) -> continueOnOwner(() -> settleAsync(ticket, value, error), false));
     }
 
+    private AsyncCall registerAsyncCall(Callback resolve, Callback reject) {
+        synchronized (lifecycle) {
+            if (closed) throw new RuntimeClosedException();
+            long[] nativeOwners = scope(handle);
+            Map<Long, CompletableFuture<Object>> owners = new HashMap<>();
+            Map<Long, CompletableFuture<Object>> inherited = inJobScope ? Map.of() : asyncOwners;
+            for (CompletableFuture<?> owner : inherited.values()) {
+                if (owner.isCancelled()) throw new CancellationException("JavaScript call canceled");
+            }
+            for (long call : nativeOwners) {
+                CompletableFuture<Object> owner = pending.get(call);
+                if (owner != null && owner.isCancelled()) throw new CancellationException("JavaScript call canceled");
+                if (owner != null && !owner.isDone()) owners.put(call, owner);
+            }
+            for (Map.Entry<Long, CompletableFuture<Object>> owner : inherited.entrySet()) {
+                if (pending.get(owner.getKey()) == owner.getValue() && !owner.getValue().isDone()) owners.put(owner.getKey(), owner.getValue());
+            }
+            AsyncCall operation = new AsyncCall(owners, resolve, reject);
+            asyncCalls.put(operation.id, operation);
+            return operation;
+        }
+    }
+
+    private CompletableFuture<?> invokeAsyncBinding(int id, Object[] args, AsyncCall operation) throws Exception {
+        AsyncBinding binding = asyncFunctions.get(id);
+        if (binding == null) {
+            discard(args);
+            throw new IllegalStateException("Unknown async host function: " + id);
+        }
+        try {
+            operation.scope = Objects.requireNonNull(binding.capture.get(), "Async scope is null");
+        } catch (Throwable error) {
+            discard(args);
+            throw error;
+        }
+        return Objects.requireNonNull(binding.function.call(args), "Async host returned a null future");
+    }
+
     private void cancelAsync(ArrayList<AsyncCall> operations) {
         for (AsyncCall operation : operations) {
             CompletableFuture<?> source;
-            synchronized (lifecycle) { source = operation.source; }
+            synchronized (lifecycle) {
+                source = operation.source;
+            }
             if (source != null) source.cancel(true);
             continueOnOwner(operation::release, false);
         }
@@ -979,56 +1123,72 @@ public final class QuickJS implements AutoCloseable {
             else operation.settling = true;
             owners = new HashMap<>(operation.owners);
         }
-        if (canceled) { operation.release(); return; }
+        if (canceled) {
+            operation.release();
+            return;
+        }
         Map<Long, CompletableFuture<Object>> previous = asyncOwners;
         asyncOwners = owners;
         long[] calls = owners.keySet().stream().mapToLong(Long::longValue).toArray();
         Runnable restore = () -> {};
         try {
-            try { restore = Objects.requireNonNull(operation.scope.enter(), "Async restore hook is null"); }
-            catch (Throwable failure) { error = failure; }
+            try {
+                restore = Objects.requireNonNull(operation.scope.enter(), "Async restore hook is null");
+            } catch (Throwable failure) {
+                error = failure;
+            }
             if (error == null) {
                 try {
                     validateAsyncValue(value, 0);
                     call((handle, callId) -> settle(handle, callId, operation.resolve.id, value, calls, false)).join();
-                } catch (Throwable failure) { error = failure; }
-            }
-            if (error != null) {
-                Throwable failure = error;
-                while (failure instanceof CompletionException && failure.getCause() != null) failure = failure.getCause();
-                if (isUncatchable(failure)) {
-                    for (long owner : owners.keySet()) complete(owner, null, failure);
-                    return;
+                } catch (Throwable failure) {
+                    error = failure;
                 }
-                String message = failure.toString();
-                call((handle, callId) -> settle(handle, callId, operation.reject.id, message, calls, true)).join();
             }
+            if (error != null) rejectAsync(operation, calls, error);
         } finally {
-            try { restore.run(); }
-            finally {
+            try {
+                restore.run();
+            } finally {
                 asyncOwners = previous;
-                synchronized (lifecycle) { asyncCalls.remove(id); }
+                synchronized (lifecycle) {
+                    asyncCalls.remove(id);
+                }
                 operation.release();
             }
         }
     }
 
+    private void rejectAsync(AsyncCall operation, long[] calls, Throwable error) {
+        Throwable failure = error;
+        while (failure instanceof CompletionException && failure.getCause() != null) failure = failure.getCause();
+        if (isUncatchable(failure)) {
+            for (long owner : calls) complete(owner, null, failure);
+            return;
+        }
+        String message = failure.toString();
+        call((handle, callId) -> settle(handle, callId, operation.reject.id, message, calls, true)).join();
+    }
+
     private static void validateAsyncValue(Object value, int depth) {
         if (depth > 64) throw new IllegalArgumentException("Async conversion exceeds 64 levels");
         if (value instanceof Reference || value instanceof Callback || value instanceof Transfer) throw new IllegalArgumentException("Async host results must be by value");
-        if (value instanceof Object[] items) for (Object item : items) validateAsyncValue(item, depth + 1);
+        if (value instanceof Object[] items) {
+            for (Object item : items) validateAsyncValue(item, depth + 1);
+        }
     }
 
     private boolean isUncatchable(Throwable error) {
-        while ((error instanceof CompletionException || error instanceof ExecutionException || error instanceof QuickJSException)
-                && error.getCause() != null) error = error.getCause();
+        while ((error instanceof CompletionException || error instanceof ExecutionException || error instanceof QuickJSException) && error.getCause() != null) error = error.getCause();
         return error instanceof ScriptException script && script.uncatchable;
     }
 
     private static void discard(Object value) {
         if (value instanceof Reference reference) reference.close();
         else if (value instanceof Callback callback) callback.close();
-        else if (value instanceof Object[] items) for (Object item : items) discard(item);
+        else if (value instanceof Object[] items) {
+            for (Object item : items) discard(item);
+        }
     }
 
     private boolean complete(long callId, Object value, String error, boolean uncatchable) {
@@ -1079,10 +1239,12 @@ public final class QuickJS implements AutoCloseable {
         inModuleHook = true;
         try {
             String url = moduleLoader == null ? null : moduleLoader.url(name);
-            if (url != null && (!java.net.URI.create(url).isAbsolute() || url.indexOf('\0') >= 0))
+            if (url != null && (!URI.create(url).isAbsolute() || url.indexOf('\0') >= 0))
                 throw new IllegalArgumentException("Module URL must be absolute");
             return url;
-        } finally { inModuleHook = false; }
+        } finally {
+            inModuleHook = false;
+        }
     }
 
     private byte[] loadBytecode(String name) {
@@ -1096,7 +1258,9 @@ public final class QuickJS implements AutoCloseable {
         } catch (RuntimeException | Error error) {
             moduleFailed = true;
             throw error;
-        } finally { inModuleHook = false; }
+        } finally {
+            inModuleHook = false;
+        }
     }
 
     private void storeBytecode(String name, String source, byte[] bytes) {
@@ -1106,10 +1270,14 @@ public final class QuickJS implements AutoCloseable {
         } catch (RuntimeException | Error error) {
             moduleFailed = true;
             throw error;
-        } finally { inModuleHook = false; }
+        } finally {
+            inModuleHook = false;
+        }
     }
 
-    private void failModule() { moduleFailed = true; }
+    private void failModule() {
+        moduleFailed = true;
+    }
 
     /**
      * Interrupts JavaScript and fails outstanding futures on its owner. Calls elsewhere
@@ -1117,6 +1285,10 @@ public final class QuickJS implements AutoCloseable {
      */
     @Override
     public void close() {
+        close(new RuntimeClosedException());
+    }
+
+    private void close(Throwable error) {
         ArrayList<CompletableFuture<?>> outstanding = new ArrayList<>();
         ArrayList<AsyncCall> asynchronous = new ArrayList<>();
         synchronized (lifecycle) {
@@ -1132,7 +1304,6 @@ public final class QuickJS implements AutoCloseable {
                 executor.execute(this::closeOwner);
             }
         }
-        IllegalStateException error = new RuntimeClosedException();
         for (CompletableFuture<?> future : outstanding) future.completeExceptionally(error);
         cancelAsync(asynchronous);
         if (!isOwnerThread()) destroyed.join();
@@ -1141,13 +1312,20 @@ public final class QuickJS implements AutoCloseable {
     private void closeOwner() {
         Throwable failure = null;
         for (Runnable hook : closeHooks) {
-            try { hook.run(); }
-            catch (Throwable error) {
+            try {
+                hook.run();
+            } catch (Throwable error) {
                 if (failure == null) failure = error;
                 else if (failure != error) failure.addSuppressed(error);
             }
         }
         closeHooks.clear();
+        try {
+            if (asyncScopeCapture != null) jobScopes(handle, false);
+        } catch (Throwable error) {
+            if (failure == null) failure = error;
+            else if (failure != error) failure.addSuppressed(error);
+        }
         try {
             synchronized (lifecycle) {
                 closeCleaned = true;
@@ -1161,6 +1339,8 @@ public final class QuickJS implements AutoCloseable {
             asyncFunctions.clear();
             bindings.clear();
             moduleLoader = null;
+            asyncScopeCapture = null;
+            detachedJobScope = null;
             unhandledRejectionListener = null;
         }
         if (failure == null) destroyed.complete(null);
@@ -1182,6 +1362,8 @@ public final class QuickJS implements AutoCloseable {
     private native void codeGeneration(long handle, boolean allowed);
 
     private native void rejections(long handle, boolean enabled);
+
+    private native void jobScopes(long handle, boolean enabled);
 
     private native void evaluate(long handle, long callId, String source, String name, boolean module);
 
