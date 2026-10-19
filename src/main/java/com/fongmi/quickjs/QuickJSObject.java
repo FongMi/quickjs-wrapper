@@ -9,6 +9,7 @@ import java.util.Objects;
 
 /** An owned reference to a value in a {@link QuickJSContext}. */
 public class QuickJSObject implements JSObject {
+
   private final QuickJSContext context;
   private final long pointer;
   private volatile int references = 1;
@@ -96,24 +97,24 @@ public class QuickJSObject implements JSObject {
     try {
       for (Method method : type.getMethods()) {
         if (!method.isAnnotationPresent(JSMethod.class)) continue;
-        binding.setProperty(
-            method.getName(),
-            args -> {
-              try {
-                return method.invoke(instance, args);
-              } catch (InvocationTargetException error) {
-                Throwable cause = error.getCause();
-                if (cause instanceof RuntimeException runtime) throw runtime;
-                if (cause instanceof Error fatal) throw fatal;
-                throw new QuickJSException(cause.toString());
-              } catch (IllegalAccessException error) {
-                throw new QuickJSException(error.toString());
-              }
-            });
+        binding.setProperty(method.getName(), args -> invokeBinding(method, instance, args));
       }
       setProperty(name, binding);
     } finally {
       binding.release();
+    }
+  }
+
+  private static Object invokeBinding(Method method, Object instance, Object[] args) {
+    try {
+      return method.invoke(instance, args);
+    } catch (InvocationTargetException error) {
+      Throwable cause = error.getCause();
+      if (cause instanceof RuntimeException runtime) throw runtime;
+      if (cause instanceof Error fatal) throw fatal;
+      throw new QuickJSException(cause.toString());
+    } catch (IllegalAccessException error) {
+      throw new QuickJSException(error.toString());
     }
   }
 
@@ -240,10 +241,13 @@ public class QuickJSObject implements JSObject {
 
   @Override
   public Map<String, Object> toMap(MapFilter filter, Object extra, MapCreator creator) {
-    checkRefCountIsZero();
-    Map<String, Object> result = Objects.requireNonNull(creator, "creator").get();
-    convertToMap(this, result, new HashMap<>(), filter, extra, creator);
-    return result;
+    return context.run(
+        () -> {
+          checkRefCountIsZero();
+          Map<String, Object> result = Objects.requireNonNull(creator, "creator").get();
+          convertToMap(this, result, new HashMap<>(), filter, extra, creator);
+          return result;
+        });
   }
 
   @Override
@@ -287,29 +291,25 @@ public class QuickJSObject implements JSObject {
       MapCreator creator,
       ArrayList<JSObject> retained) {
     seen.put(object.getPointer(), result);
-    JSArray names = object instanceof JSArray ? null : object.getNames();
-    try {
-      int size = names == null ? ((JSArray) object).length() : names.length();
-      for (int index = 0; index < size; index++) {
-        String key = names == null ? null : (String) names.get(index);
-        if (key != null && filter != null && filter.shouldSkipKey(key, object.getPointer(), extra))
-          continue;
-        Object value = names == null ? ((JSArray) object).get(index) : object.getProperty(key);
-        JSObject child = value instanceof JSObject ? (JSObject) value : null;
-        if (child != null) retained.add(child);
-        if (value instanceof JSFunction) continue;
-        if (child != null) {
-          value = seen.get(child.getPointer());
-          if (value == null) {
-            value = child instanceof JSArray ? new ArrayList<>() : creator.get();
-            convert(child, value, seen, filter, extra, creator, retained);
-          }
+    Object[] names = object instanceof JSArray ? null : context.propertyNames(object);
+    int size = names == null ? ((JSArray) object).length() : names.length;
+    for (int index = 0; index < size; index++) {
+      String key = names == null ? null : (String) names[index];
+      if (key != null && filter != null && filter.shouldSkipKey(key, object.getPointer(), extra))
+        continue;
+      Object value = names == null ? ((JSArray) object).get(index) : object.getProperty(key);
+      JSObject child = value instanceof JSObject ? (JSObject) value : null;
+      if (child != null) retained.add(child);
+      if (value instanceof JSFunction) continue;
+      if (child != null) {
+        value = seen.get(child.getPointer());
+        if (value == null) {
+          value = child instanceof JSArray ? new ArrayList<>() : creator.get();
+          convert(child, value, seen, filter, extra, creator, retained);
         }
-        if (result instanceof Map) ((Map<String, Object>) result).put(key, value);
-        else ((ArrayList<Object>) result).add(value);
       }
-    } finally {
-      if (names != null) names.release();
+      if (result instanceof Map) ((Map<String, Object>) result).put(key, value);
+      else ((ArrayList<Object>) result).add(value);
     }
   }
 

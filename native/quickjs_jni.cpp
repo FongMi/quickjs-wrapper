@@ -789,6 +789,14 @@ void result(Runtime *rt, jlong id, JSValue value) {
     JS_FreeValue(ctx, value);
 }
 
+void reference_result(Runtime *rt, jlong id, JSValue value, bool references = true, bool buffers = false) {
+    if (JS_IsException(value)) {
+        ScriptError error = take_error(rt);
+        complete(rt, id, JS_UNDEFINED, &error);
+    } else complete(rt, id, value, nullptr, references, buffers);
+    JS_FreeValue(rt->context, value);
+}
+
 int interrupted(JSContext *, void *opaque) {
     auto rt = static_cast<Runtime *>(opaque);
     if (rt->stopping.load(std::memory_order_relaxed)) return 1;
@@ -1199,6 +1207,15 @@ bool arguments(Runtime *rt, jobjectArray objects, std::vector<JSValue> &values) 
     return true;
 }
 
+JSValue call_function(Runtime *rt, JSValueConst function, JSValueConst receiver, jobjectArray objects) {
+    if (!JS_IsFunction(rt->context, function)) return JS_ThrowTypeError(rt->context, "Reference is not callable");
+    std::vector<JSValue> values;
+    JSValue result = arguments(rt, objects, values)
+        ? JS_Call(rt->context, function, receiver, static_cast<int>(values.size()), values.data()) : JS_EXCEPTION;
+    for (JSValue value : values) JS_FreeValue(rt->context, value);
+    return result;
+}
+
 std::string value_string(Runtime *rt, JSValueConst value) {
     size_t size;
     const char *text = JS_ToCStringLen(rt->context, &size, value);
@@ -1216,6 +1233,10 @@ JSValue reference_operation(Runtime *rt, const std::string &operation,
     if (operation == "receiver" && arity(0)) return JS_DupValue(ctx, rt->host_receiver);
     if (operation == "newObject" && arity(0)) return JS_NewObject(ctx);
     if (operation == "newArray" && arity(0)) return JS_NewArray(ctx);
+    if (operation == "newArray" && arity(1)) {
+        if (!JS_IsArray(args[0])) return JS_ThrowTypeError(ctx, "Array values must be an array");
+        return JS_DupValue(ctx, args[0]);
+    }
     if ((operation == "evaluate" || operation == "evaluateReference" || operation == "compile") && arity(3)) {
         std::string source = value_string(rt, args[0]);
         if (JS_HasException(ctx)) return JS_EXCEPTION;
@@ -1289,28 +1310,6 @@ JSValue reference_operation(Runtime *rt, const std::string &operation,
         }
         JS_FreeAtom(ctx, atom);
         return present < 0 ? JS_EXCEPTION : JS_NewBool(ctx, present != 0);
-    }
-    if (operation == "call" && arity(3)) {
-        if (!JS_IsFunction(ctx, args[0])) return JS_ThrowTypeError(ctx, "Reference is not callable");
-        if (!JS_IsArray(args[2])) return JS_ThrowTypeError(ctx, "Call arguments must be an array");
-        JSValue length_value = JS_GetPropertyStr(ctx, args[2], "length");
-        uint32_t length;
-        int error = JS_ToUint32(ctx, &length, length_value);
-        JS_FreeValue(ctx, length_value);
-        if (error) return JS_EXCEPTION;
-        if (length > static_cast<uint32_t>(std::numeric_limits<int>::max()))
-            return JS_ThrowRangeError(ctx, "Too many call arguments");
-        std::vector<JSValue> values;
-        JSValue result = JS_UNDEFINED;
-        for (uint32_t i = 0; i < length; ++i) {
-            JSValue value = JS_GetPropertyUint32(ctx, args[2], i);
-            if (JS_IsException(value)) { result = JS_EXCEPTION; break; }
-            values.push_back(value);
-        }
-        if (!JS_IsException(result)) result = JS_Call(ctx, args[0], JS_IsNull(args[1]) ? JS_UNDEFINED : args[1],
-                                                    static_cast<int>(values.size()), values.data());
-        for (JSValue value : values) JS_FreeValue(ctx, value);
-        return result;
     }
     if (operation == "stringify" && arity(1)) return JS_JSONStringify(ctx, args[0], JS_UNDEFINED, JS_UNDEFINED);
     if (operation == "parse" && arity(1)) {
@@ -1536,11 +1535,20 @@ extern "C" JNIEXPORT void JNICALL Java_com_fongmi_quickjs_QuickJS_reference(
     JSValue value = env->ExceptionCheck() ? java_error(rt)
         : arguments(rt, objects, values) ? reference_operation(rt, name, values, objects) : JS_EXCEPTION;
     for (JSValue argument : values) JS_FreeValue(rt->context, argument);
-    if (JS_IsException(value)) {
-        ScriptError error = take_error(rt);
-        complete(rt, call, JS_UNDEFINED, &error);
-    } else complete(rt, call, value, nullptr, name != "keys" && name != "memory" && name != "resources", name == "evaluateReference");
-    JS_FreeValue(rt->context, value);
+    reference_result(rt, call, value, name != "keys" && name != "memory" && name != "resources", name == "evaluateReference");
+}
+
+extern "C" JNIEXPORT void JNICALL Java_com_fongmi_quickjs_QuickJS_callFunction(
+    JNIEnv *env, jobject, jlong handle, jlong call, jobject reference, jobject receiver, jobjectArray objects) {
+    Runtime *rt = get(handle);
+    Entry entry(rt, env, call);
+    JSValue function = from_java(rt, reference);
+    JSValue target = JS_IsException(function) ? JS_EXCEPTION : receiver ? from_java(rt, receiver) : JS_UNDEFINED;
+    JSValue value = env->ExceptionCheck() ? java_error(rt)
+        : JS_IsException(function) || JS_IsException(target) ? JS_EXCEPTION : call_function(rt, function, target, objects);
+    JS_FreeValue(rt->context, function);
+    JS_FreeValue(rt->context, target);
+    reference_result(rt, call, value);
 }
 
 extern "C" JNIEXPORT jlong JNICALL Java_com_fongmi_quickjs_QuickJS_acquireBuffer(
@@ -1668,14 +1676,10 @@ extern "C" JNIEXPORT void JNICALL Java_com_fongmi_quickjs_QuickJS_invoke(
     JSValue function = JS_IsException(object) ? JS_EXCEPTION : JS_GetProperty(ctx, object, function_atom);
     JS_FreeAtom(ctx, object_atom);
     JS_FreeAtom(ctx, function_atom);
-    std::vector<JSValue> values;
     JSValue value;
     if (JS_IsException(function)) value = JS_EXCEPTION;
     else if (JS_IsUndefined(function)) value = JS_UNDEFINED;
-    else if (!JS_IsFunction(ctx, function)) value = JS_ThrowTypeError(ctx, "Property is not callable");
-    else if (!arguments(rt, objects, values)) value = JS_EXCEPTION;
-    else value = JS_Call(ctx, function, object, static_cast<int>(values.size()), values.data());
-    for (JSValue argument : values) JS_FreeValue(ctx, argument);
+    else value = call_function(rt, function, object, objects);
     JS_FreeValue(ctx, function);
     JS_FreeValue(ctx, object);
     result(rt, call, value);
@@ -1691,11 +1695,7 @@ extern "C" JNIEXPORT void JNICALL Java_com_fongmi_quickjs_QuickJS_callback(
         return;
     }
     JSValue function = JS_DupValue(rt->context, found->second.function);
-    std::vector<JSValue> values;
-    JSValue value = arguments(rt, objects, values)
-                    ? JS_Call(rt->context, function, JS_UNDEFINED, static_cast<int>(values.size()), values.data())
-                    : JS_EXCEPTION;
-    for (JSValue argument : values) JS_FreeValue(rt->context, argument);
+    JSValue value = call_function(rt, function, JS_UNDEFINED, objects);
     JS_FreeValue(rt->context, function);
     result(rt, call, value);
 }

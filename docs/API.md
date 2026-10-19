@@ -38,6 +38,10 @@ asynchronous callback on that owner.
 queues work and can establish a boundary after the current native job drain.
 References and callbacks belong to their originating runtime and must be closed.
 
+`callFunction(reference, receiver, args...)` directly invokes a retained function.
+Null selects an undefined receiver. Object and Promise results remain retained
+references, as with `reference` operations; this method does not await a Promise.
+
 `bind` installs a synchronous Java host function. `bindAsync` accepts a function
 returning `CompletableFuture<?>` and exposes an intrinsic JavaScript Promise:
 
@@ -213,6 +217,11 @@ acquisitions. Returning a JSObject from a JSCallFunction transfers one
 acquisition to JavaScript. Byte arrays become ArrayBuffers; typed arrays remain
 JSObjects. `toMap`/`toArray` preserve cycles and shared children.
 `getPointer()` is an opaque identity rather than an external native address.
-Function creators receive the context and function identity; receiver retention
-belongs to the context.
+`toMap` and `toArray` traverse the complete graph in one owner submission,
+including supplied map creators and filters. Function creators receive the
+context and function identity; receiver retention belongs to the context.
+`createNewJSArray(values...)` creates an array in one conversion. Map conversion
+uses a Java key snapshot rather than a temporary facade array. Custom creators
+must return a fresh wrapper for each acquisition. Diagnostic object records
+are unordered snapshots; identity and receiver tracking do not depend on equals.
 Console formatting uses compact JSON with cycle markers.

@@ -5,6 +5,7 @@ import java.util.HashMap;
 import java.util.Map;
 
 public class QuickJSArray extends QuickJSObject implements JSArray {
+
   public QuickJSArray(QuickJSContext context, long pointer) {
     super(context, pointer);
   }
@@ -31,9 +32,13 @@ public class QuickJSArray extends QuickJSObject implements JSArray {
 
   @Override
   public ArrayList<Object> toArray(MapFilter filter, Object extra, MapCreator creator) {
-    checkRefCountIsZero();
-    ArrayList<Object> result = new ArrayList<>(length());
-    convertToMap(this, result, new HashMap<>(), filter, extra, creator);
-    return result;
+    return getContext()
+        .run(
+            () -> {
+              checkRefCountIsZero();
+              ArrayList<Object> result = new ArrayList<>(length());
+              convertToMap(this, result, new HashMap<>(), filter, extra, creator);
+              return result;
+            });
   }
 }
