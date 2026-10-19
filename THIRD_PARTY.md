@@ -1,45 +1,43 @@
 # Third-party sources
 
+## Engine
+
 `vendor/quickjs` pins [FongMi/quickjs](https://github.com/FongMi/quickjs/tree/fongmi),
-branch `fongmi`, with upstream updates after v0.17.0
-(`6d46d07d04041b40f4f49eaa7fdebe44c314c699`).
-
-- Upstream: <https://github.com/quickjs-ng/quickjs>
-- Base release: <https://github.com/quickjs-ng/quickjs/releases/tag/v0.17.0>
-- License: MIT; retain `vendor/quickjs/LICENSE` and source headers.
-
-Read the exact engine pin with:
+based on [QuickJS-NG](https://github.com/quickjs-ng/quickjs).
+The submodule records the exact source revision:
 
 ```powershell
 git ls-tree HEAD vendor/quickjs
 ```
 
-The native runtime compiles only `dtoa.c`, `libregexp.c`, `libunicode.c` and
-`quickjs.c`, with their upstream headers. QuickJS libc, CLI programs, `std` and
-`os` are excluded from the runtime.
+The runtime builds the engine core without the CLI or libc helpers.
+Retain its MIT license and source headers. Engine changes are maintained in
+the engine repository; wrapper contracts are documented in [Java API](docs/API.md).
 
-## Engine changes on the fongmi branch
+## Wrapper and tools
 
-- Release external ArrayBuffer storage when detached transfer allocation fails.
-- Expose validated buffer ranges and managed allocator exchange for JNI buffer
-  leases; report the current length of length-tracking typed-array views.
-- Discard queued jobs through an explicit terminal-lifecycle API.
-- Add an opt-in context policy for eval/Function string compilation.
-- Correct optional-chain and nested-new constructor parsing.
-- Resolve imported/re-exported module bindings by their final identity, and
-  complete asynchronous module state and rejection propagation in order.
-- Correct typed-array `with` conversion after resize and BigInt locale formatting.
-- Keep WeakRef constructor and successful deref targets alive through the current
-  job until the embedding clears kept objects after its microtask checkpoint.
-- Expose captured registration context for Promise jobs and an explicit
-  no-context boundary for FinalizationRegistry cleanup. The wrapper enters and
-  restores host scopes around these jobs.
+The Java API and JNI integration are FongMi code. Gradle wrapper files come
+from TV under Apache License 2.0; retain [gradle/LICENSE](gradle/LICENSE).
 
-The pinned engine uses a context-based `JSInterruptHandler`, uncatchable
-OOM/InternalError exceptions and bytecode version 29. See [Java API](docs/API.md)
-for wrapper bytecode and ownership contracts.
+## Web bundle
 
-## Wrapper and build tools
+Versions are locked in [web/package-lock.json](web/package-lock.json).
+The JAR includes [dependency notices](src/main/resources/META-INF/licenses/web.txt).
 
-The Java API, UTF-8 codecs and JNI integration are FongMi code. Gradle wrapper
-files come from TV under Apache License 2.0; retain `gradle/LICENSE`.
+| Package | License |
+| --- | --- |
+| @exodus/bytes | MIT |
+| @web3-storage/multipart-parser | Apache-2.0 AND MIT |
+| core-js-pure | MIT |
+| event-target-shim | MIT |
+| fetch-blob | MIT |
+| formdata-polyfill | MIT |
+| web-streams-polyfill | MIT |
+| whatwg-url | MIT |
+
+esbuild is a build tool. The multipart-parser archive omits its license files;
+copies from upstream commit `844cdf7bcb4d86274ae36fce70b1480a78a16774` are kept
+in [web/licenses/multipart-parser](web/licenses/multipart-parser).
+
+[web/build.mjs](web/build.mjs) applies the runtime adaptations and generates
+the bundle and notices. Keep those checks when updating dependencies.

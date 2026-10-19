@@ -1,4 +1,5 @@
 .gradle/
+web/node_modules/
 .cxx/
 build/
 **/build/
