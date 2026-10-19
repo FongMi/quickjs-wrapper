@@ -565,10 +565,15 @@ JSValue from_java(Runtime *rt, jobject value, int depth) {
     if (env->IsInstanceOf(value, rt->bytes_class)) {
         auto array = static_cast<jbyteArray>(value);
         jsize size = env->GetArrayLength(array);
-        jbyte *data = env->GetByteArrayElements(array, nullptr);
-        if (!data && size) return JS_EXCEPTION;
-        JSValue result = JS_NewArrayBufferCopy(ctx, reinterpret_cast<uint8_t *>(data), size);
-        if (data) env->ReleaseByteArrayElements(array, data, JNI_ABORT);
+        JSValue result = JS_NewArrayBufferCopy(ctx, nullptr, size);
+        if (JS_IsException(result)) return result;
+        size_t length;
+        uint8_t *data = JS_GetArrayBuffer(ctx, &length, result);
+        if (size) env->GetByteArrayRegion(array, 0, size, reinterpret_cast<jbyte *>(data));
+        if (env->ExceptionCheck()) {
+            JS_FreeValue(ctx, result);
+            return java_error(rt);
+        }
         return result;
     }
     if (env->IsInstanceOf(value, rt->direct_buffer_class)) {
@@ -602,7 +607,7 @@ JSValue from_java(Runtime *rt, jobject value, int depth) {
             jobject object = env->GetObjectArrayElement(array, i);
             JSValue item = from_java(rt, object, depth + 1);
             if (object) env->DeleteLocalRef(object);
-            if (JS_IsException(item) || JS_SetPropertyUint32(ctx, result, i, item) < 0) {
+            if (JS_IsException(item) || JS_DefinePropertyValueUint32(ctx, result, i, item, JS_PROP_C_W_E) < 0) {
                 JS_FreeValue(ctx, result);
                 return JS_EXCEPTION;
             }
@@ -616,43 +621,14 @@ JSValue from_java(Runtime *rt, jobject value, int depth) {
         env->DeleteLocalRef(text);
         return result;
     }
-    if (env->IsInstanceOf(value, rt->binary_class)) {
-        auto json = static_cast<jstring>(env->CallObjectMethod(value, rt->binary_json));
-        if (env->ExceptionCheck()) return java_error(rt);
-        auto property = static_cast<jstring>(env->CallObjectMethod(value, rt->binary_property));
-        if (env->ExceptionCheck()) { env->DeleteLocalRef(json); return java_error(rt); }
-        auto data = static_cast<jbyteArray>(env->CallObjectMethod(value, rt->binary_bytes));
-        if (env->ExceptionCheck()) {
-            env->DeleteLocalRef(json);
-            env->DeleteLocalRef(property);
-            return java_error(rt);
-        }
-        JSValue result = parse_json(rt, json);
-        if (!JS_IsException(result)) {
-            JSAtom atom = property_atom(rt, property);
-            JSValue buffer = from_java(rt, data, depth + 1);
-            if (atom == JS_ATOM_NULL || JS_IsException(buffer)) {
-                JS_FreeValue(ctx, buffer);
-                JS_FreeValue(ctx, result);
-                result = JS_EXCEPTION;
-            } else if (JS_SetProperty(ctx, result, atom, buffer) < 0) {
-                JS_FreeValue(ctx, result);
-                result = JS_EXCEPTION;
-            }
-            JS_FreeAtom(ctx, atom);
-        }
-        env->DeleteLocalRef(json);
-        env->DeleteLocalRef(property);
-        if (data) env->DeleteLocalRef(data);
-        return result;
-    }
+    bool binary_reply = env->IsInstanceOf(value, rt->binary_class);
     bool text_reply = env->IsInstanceOf(value, rt->text_class);
-    if (text_reply || env->IsInstanceOf(value, rt->byte_array_class)) {
-        auto json = static_cast<jstring>(env->CallObjectMethod(value, text_reply ? rt->text_json : rt->byte_array_json));
+    if (binary_reply || text_reply || env->IsInstanceOf(value, rt->byte_array_class)) {
+        auto json = static_cast<jstring>(env->CallObjectMethod(value, binary_reply ? rt->binary_json : text_reply ? rt->text_json : rt->byte_array_json));
         if (env->ExceptionCheck()) return java_error(rt);
-        auto property = static_cast<jstring>(env->CallObjectMethod(value, text_reply ? rt->text_property : rt->byte_array_property));
+        auto property = static_cast<jstring>(env->CallObjectMethod(value, binary_reply ? rt->binary_property : text_reply ? rt->text_property : rt->byte_array_property));
         if (env->ExceptionCheck()) { env->DeleteLocalRef(json); return java_error(rt); }
-        jobject payload = env->CallObjectMethod(value, text_reply ? rt->text_value : rt->byte_array_bytes);
+        jobject payload = env->CallObjectMethod(value, binary_reply ? rt->binary_bytes : text_reply ? rt->text_value : rt->byte_array_bytes);
         if (env->ExceptionCheck()) {
             env->DeleteLocalRef(json);
             env->DeleteLocalRef(property);
@@ -661,13 +637,14 @@ JSValue from_java(Runtime *rt, jobject value, int depth) {
         JSValue result = parse_json(rt, json);
         if (!JS_IsException(result) && (!JS_IsObject(result) || JS_IsArray(result))) {
             JS_FreeValue(ctx, result);
-            result = JS_ThrowTypeError(ctx, "%s metadata must be a JSON object", text_reply ? "Text" : "ByteArray");
+            result = JS_ThrowTypeError(ctx, "%s metadata must be a JSON object", binary_reply ? "Binary" : text_reply ? "Text" : "ByteArray");
         }
         if (!JS_IsException(result)) {
             JSAtom atom = property_atom(rt, property);
             JSValue data = JS_EXCEPTION;
             if (atom != JS_ATOM_NULL) {
-                data = text_reply ? from_string(rt, static_cast<jstring>(payload))
+                data = binary_reply ? from_java(rt, payload, depth + 1)
+                                  : text_reply ? from_string(rt, static_cast<jstring>(payload))
                                   : signed_byte_array(rt, static_cast<jbyteArray>(payload));
             }
             if (JS_IsException(data) || JS_DefinePropertyValue(ctx, result, atom, data, JS_PROP_C_W_E) < 0) {
@@ -1328,7 +1305,7 @@ JSValue reference_operation(Runtime *rt, const std::string &operation,
         JSValue array = JS_NewArray(ctx);
         for (uint32_t i = 0; !JS_IsException(array) && i < count; ++i) {
             JSValue name = JS_AtomToString(ctx, properties[i].atom);
-            if (JS_IsException(name) || JS_SetPropertyUint32(ctx, array, i, name) < 0) {
+            if (JS_IsException(name) || JS_DefinePropertyValueUint32(ctx, array, i, name, JS_PROP_C_W_E) < 0) {
                 JS_FreeValue(ctx, array);
                 array = JS_EXCEPTION;
             }
