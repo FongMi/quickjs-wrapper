@@ -62,6 +62,7 @@ struct Runtime {
     JSValue error_stack_getter = JS_UNDEFINED;
     JSValue host_receiver = JS_UNDEFINED;
     std::unordered_map<jlong, Callback> callbacks;
+    std::unordered_map<jlong, size_t> callback_origins;
     std::unordered_map<jlong, Reference> references;
     std::unordered_map<void *, jlong> identities;
     std::unordered_map<void *, JSValue> rejections;
@@ -337,6 +338,15 @@ JSValue java_error(Runtime *rt) {
 
 void release_reference(Runtime *rt, jlong id);
 
+void release_callback(Runtime *rt, jlong id) {
+    auto found = rt->callbacks.find(id);
+    if (found == rt->callbacks.end()) return;
+    jlong origin = found->second.origin;
+    if (origin && --rt->callback_origins.at(origin) == 0) rt->callback_origins.erase(origin);
+    JS_FreeValue(rt->context, found->second.function);
+    rt->callbacks.erase(found);
+}
+
 struct Conversion {
     Runtime *rt;
     Conversion *previous;
@@ -350,13 +360,7 @@ struct Conversion {
     ~Conversion() {
         rt->conversion = previous;
         if (committed) return;
-        for (jlong id : callbacks) {
-            auto found = rt->callbacks.find(id);
-            if (found != rt->callbacks.end()) {
-                JS_FreeValue(rt->context, found->second.function);
-                rt->callbacks.erase(found);
-            }
-        }
+        for (jlong id : callbacks) release_callback(rt, id);
         for (jlong id : references) if (rt->references.count(id)) release_reference(rt, id);
     }
 };
@@ -447,11 +451,9 @@ jobject to_java(Runtime *rt, JSValueConst value, int depth) {
     if (JS_IsFunction(ctx, value)) {
         jlong id = rt->next_callback++;
         rt->callbacks.emplace(id, Callback{JS_DupValue(ctx, value), rt->active});
+        if (rt->active) ++rt->callback_origins[rt->active];
         jobject result = env->NewObject(rt->callback_class, rt->callback_constructor, rt->owner, id);
-        if (!result) {
-            JS_FreeValue(ctx, rt->callbacks.at(id).function);
-            rt->callbacks.erase(id);
-        }
+        if (!result) release_callback(rt, id);
         if (result && rt->conversion) rt->conversion->callbacks.push_back(id);
         return result;
     }
@@ -808,9 +810,8 @@ int interrupted(JSContext *, void *opaque) {
 void retire_cancellations(Runtime *rt) {
     std::lock_guard<std::mutex> lock(rt->cancel_mutex);
     for (auto iterator = rt->canceled.begin(); iterator != rt->canceled.end();) {
-        bool retained = *iterator > rt->last_call;
+        bool retained = *iterator > rt->last_call || rt->callback_origins.count(*iterator);
         for (jlong call : rt->executing) retained |= call == *iterator;
-        for (const auto &callback : rt->callbacks) retained |= callback.second.origin == *iterator;
         if (retained) ++iterator;
         else iterator = rt->canceled.erase(iterator);
     }
@@ -1369,6 +1370,7 @@ JSValue reference_operation(Runtime *rt, const std::string &operation,
         }
         RESOURCE_FIELD("jniGlobalRefs", global_references.load(std::memory_order_relaxed))
         RESOURCE_FIELD("callbacks", rt->callbacks.size())
+        RESOURCE_FIELD("callbackOrigins", rt->callback_origins.size())
         RESOURCE_FIELD("references", rt->references.size())
         RESOURCE_FIELD("bufferLeases", rt->buffer_leases.size())
         RESOURCE_FIELD("rejections", rt->rejections.size())
@@ -1769,11 +1771,7 @@ extern "C" JNIEXPORT void JNICALL Java_com_fongmi_quickjs_QuickJS_release(
     JNIEnv *env, jobject, jlong handle, jlong id) {
     Runtime *rt = get(handle);
     rt->env = env;
-    auto found = rt->callbacks.find(id);
-    if (found != rt->callbacks.end()) {
-        JS_FreeValue(rt->context, found->second.function);
-        rt->callbacks.erase(found);
-    }
+    release_callback(rt, id);
     retire_cancellations(rt);
 }
 
