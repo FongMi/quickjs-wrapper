@@ -1266,7 +1266,7 @@ int import_type(JSContext *ctx, JSValueConst attributes) {
     return result;
 }
 
-int initialize_json_module(JSContext *ctx, JSModuleDef *module) {
+int initialize_default_module(JSContext *ctx, JSModuleDef *module) {
     return JS_SetModuleExport(ctx, module, "default", JS_GetModulePrivateValue(ctx, module));
 }
 
@@ -1320,7 +1320,7 @@ JSModuleDef *load(JSContext *ctx, const char *name, void *opaque, JSValueConst a
         }
         JSValue value = JS_ParseJSON(ctx, source.c_str(), source.size(), name);
         if (JS_IsException(value)) return nullptr;
-        JSModuleDef *result = JS_NewCModule(ctx, name, initialize_json_module);
+        JSModuleDef *result = JS_NewCModule(ctx, name, initialize_default_module);
         if (!result) {
             JS_FreeValue(ctx, value);
             return nullptr;
@@ -1587,16 +1587,25 @@ JSValue reference_operation(Runtime *rt, const std::string &operation,
     return JS_ThrowTypeError(ctx, "Unknown reference operation or invalid argument count: %s", operation.c_str());
 }
 
-void bind_function(Runtime *rt, jstring name, jint id, JSCFunctionData *callback, int magic) {
+JSValue invoke_method(Runtime *rt, JSValueConst object, jstring method, jobjectArray args) {
+    JSContext *ctx = rt->context;
+    JSAtom atom = property_atom(rt, method);
+    JSValue function = atom == JS_ATOM_NULL || JS_IsException(object) ? JS_EXCEPTION : JS_GetProperty(ctx, object, atom);
+    JS_FreeAtom(ctx, atom);
+    JSValue value = JS_IsException(function) ? JS_EXCEPTION
+        : JS_IsUndefined(function) ? JS_UNDEFINED : call_function(rt, function, object, args);
+    JS_FreeValue(ctx, function);
+    return value;
+}
+
+void bind_function(Runtime *rt, JSValueConst object, jstring name, jint id, JSCFunctionData *callback, int magic) {
     JSAtom atom = property_atom(rt, name);
     JSValue data = JS_NewInt32(rt->context, id);
     JSValue function = atom == JS_ATOM_NULL ? JS_EXCEPTION
         : JS_NewCFunctionData(rt->context, callback, 0, magic, 1, &data);
-    JSValue global = JS_GetGlobalObject(rt->context);
     if (JS_IsException(function)) JS_FreeValue(rt->context, function);
-    else JS_SetProperty(rt->context, global, atom, function);
+    else JS_SetProperty(rt->context, object, atom, function);
     JS_FreeAtom(rt->context, atom);
-    JS_FreeValue(rt->context, global);
     JS_FreeValue(rt->context, data);
     if (!rt->env->ExceptionCheck() && JS_HasException(rt->context)) throw_script_error(rt);
 }
@@ -1876,21 +1885,23 @@ extern "C" JNIEXPORT void JNICALL Java_com_fongmi_quickjs_QuickJS_invoke(
     Entry entry(rt, env, call);
     JSContext *ctx = rt->context;
     JSValue global = JS_GetGlobalObject(ctx);
-    JSAtom object_atom = property_atom(rt, object_name);
-    JSAtom function_atom = property_atom(rt, method);
-    JSValue object = object_atom == JS_ATOM_NULL || function_atom == JS_ATOM_NULL ? JS_EXCEPTION
-                    : env->GetStringLength(object_name) == 0 ? JS_DupValue(ctx, global)
-                    : JS_GetProperty(ctx, global, object_atom);
+    JSAtom atom = property_atom(rt, object_name);
+    JSValue object = atom == JS_ATOM_NULL ? JS_EXCEPTION
+        : env->GetStringLength(object_name) == 0 ? JS_DupValue(ctx, global) : JS_GetProperty(ctx, global, atom);
+    JS_FreeAtom(ctx, atom);
     JS_FreeValue(ctx, global);
-    JSValue function = JS_IsException(object) ? JS_EXCEPTION : JS_GetProperty(ctx, object, function_atom);
-    JS_FreeAtom(ctx, object_atom);
-    JS_FreeAtom(ctx, function_atom);
-    JSValue value;
-    if (JS_IsException(function)) value = JS_EXCEPTION;
-    else if (JS_IsUndefined(function)) value = JS_UNDEFINED;
-    else value = call_function(rt, function, object, objects);
-    JS_FreeValue(ctx, function);
+    JSValue value = invoke_method(rt, object, method, objects);
     JS_FreeValue(ctx, object);
+    result(rt, call, value);
+}
+
+extern "C" JNIEXPORT void JNICALL Java_com_fongmi_quickjs_QuickJS_invokeObject(
+    JNIEnv *env, jobject, jlong handle, jlong call, jobject target, jstring method, jobjectArray objects) {
+    Runtime *rt = get(handle);
+    Entry entry(rt, env, call);
+    JSValue object = from_java(rt, target);
+    JSValue value = invoke_method(rt, object, method, objects);
+    JS_FreeValue(rt->context, object);
     result(rt, call, value);
 }
 
@@ -1913,14 +1924,49 @@ extern "C" JNIEXPORT void JNICALL Java_com_fongmi_quickjs_QuickJS_bind(
     JNIEnv *env, jobject, jlong handle, jstring name, jint id, jboolean references) {
     Runtime *rt = get(handle);
     Entry entry(rt, env, 0);
-    bind_function(rt, name, id, host_call, references);
+    JSValue object = JS_GetGlobalObject(rt->context);
+    bind_function(rt, object, name, id, host_call, references);
+    JS_FreeValue(rt->context, object);
 }
 
 extern "C" JNIEXPORT void JNICALL Java_com_fongmi_quickjs_QuickJS_bindAsync(
     JNIEnv *env, jobject, jlong handle, jstring name, jint id) {
     Runtime *rt = get(handle);
     Entry entry(rt, env, 0);
-    bind_function(rt, name, id, async_host_call, 0);
+    JSValue object = JS_GetGlobalObject(rt->context);
+    bind_function(rt, object, name, id, async_host_call, 0);
+    JS_FreeValue(rt->context, object);
+}
+
+extern "C" JNIEXPORT void JNICALL Java_com_fongmi_quickjs_QuickJS_bindObject(
+    JNIEnv *env, jobject, jlong handle, jobject target, jstring name, jint id, jboolean async, jboolean references) {
+    Runtime *rt = get(handle);
+    Entry entry(rt, env, 0);
+    JSValue object = from_java(rt, target);
+    if (!JS_IsException(object) && !JS_IsObject(object)) JS_ThrowTypeError(rt->context, "Binding target must be an object");
+    if (!env->ExceptionCheck() && !JS_HasException(rt->context)) bind_function(rt, object, name, id, async ? async_host_call : host_call, async ? 0 : references);
+    JS_FreeValue(rt->context, object);
+    if (!env->ExceptionCheck() && JS_HasException(rt->context)) throw_script_error(rt);
+}
+
+extern "C" JNIEXPORT void JNICALL Java_com_fongmi_quickjs_QuickJS_registerModule(
+    JNIEnv *env, jobject, jlong handle, jstring name, jobject exports) {
+    Runtime *rt = get(handle);
+    Entry entry(rt, env, 0);
+    JSContext *ctx = rt->context;
+    std::string module_name = utf8(env, name);
+    if (env->ExceptionCheck()) return;
+    if (module_name.empty() || module_name.find('\0') != std::string::npos) {
+        JS_ThrowTypeError(ctx, "Module name must be nonempty and cannot contain NUL");
+        throw_script_error(rt);
+        return;
+    }
+    JSValue object = from_java(rt, exports);
+    if (!JS_IsException(object) && !JS_IsObject(object)) JS_ThrowTypeError(ctx, "Module exports must be an object");
+    JSModuleDef *module = env->ExceptionCheck() || JS_HasException(ctx) ? nullptr : JS_NewCModule(ctx, module_name.c_str(), initialize_default_module);
+    if (module && JS_AddModuleExport(ctx, module, "default") == 0) JS_SetModulePrivateValue(ctx, module, JS_DupValue(ctx, object));
+    JS_FreeValue(ctx, object);
+    if (!env->ExceptionCheck() && JS_HasException(ctx)) throw_script_error(rt);
 }
 
 extern "C" JNIEXPORT jlongArray JNICALL Java_com_fongmi_quickjs_QuickJS_scope(
