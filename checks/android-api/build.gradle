@@ -20,4 +20,7 @@ android {
     }
 }
 
-dependencies { coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs_nio:2.1.5' }
+dependencies {
+    implementation files('../../libs/chicory-runtime-android.jar')
+    coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs_nio:2.1.5'
+}

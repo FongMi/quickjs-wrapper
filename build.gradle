@@ -14,6 +14,16 @@ java {
     withSourcesJar()
 }
 
+dependencies {
+    implementation files('libs/chicory-runtime-android.jar')
+}
+
+tasks.named('jar', Jar) {
+    from(zipTree('libs/chicory-runtime-android.jar')) { exclude 'META-INF/MANIFEST.MF' }
+    preserveFileTimestamps = false
+    reproducibleFileOrder = true
+}
+
 tasks.withType(JavaCompile).configureEach {
     options.encoding = 'UTF-8'
     options.release = 17

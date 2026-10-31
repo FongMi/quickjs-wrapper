@@ -64,8 +64,14 @@ jobs:
           mkdir artifacts
           cp build/libs/*.jar artifacts/
           cp runtime/build/outputs/aar/runtime-release.aar artifacts/
+          python - <<'PY'
+          import json, os, pathlib, subprocess
+          revision = lambda directory: subprocess.check_output(['git', '-C', directory, 'rev-parse', 'HEAD'], text=True).strip()
+          info = {'wrapperCommit': revision('.'), 'quickjsCommit': revision('vendor/quickjs'), 'runId': os.environ['GITHUB_RUN_ID']}
+          pathlib.Path('artifacts/BUILD_INFO.json').write_text(json.dumps(info, indent=2) + '\n')
+          PY
           cd artifacts
-          sha256sum *.jar *.aar > SHA256SUMS
+          sha256sum *.jar *.aar BUILD_INFO.json > SHA256SUMS
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: quickjs-android${{ matrix.thin_lto && '-lto' || '' }}
@@ -108,6 +114,11 @@ jobs:
           if ($LASTEXITCODE) { throw 'Host JNI build failed.' }
           New-Item -ItemType Directory artifacts | Out-Null
           Copy-Item "$env:RUNNER_TEMP/quickjs-host/Release/quickjs-wrapper.dll" artifacts/
+          [ordered]@{
+            wrapperCommit = (git rev-parse HEAD)
+            quickjsCommit = (git -C vendor/quickjs rev-parse HEAD)
+            runId = $env:GITHUB_RUN_ID
+          } | ConvertTo-Json | Set-Content artifacts/BUILD_INFO.json -Encoding utf8
           Get-FileHash artifacts/* -Algorithm SHA256 |
             ForEach-Object { $_.Hash.ToLowerInvariant() + '  ' + (Split-Path -Leaf $_.Path) } |
             Set-Content artifacts/SHA256SUMS
