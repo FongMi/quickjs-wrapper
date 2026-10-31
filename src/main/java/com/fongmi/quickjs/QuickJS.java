@@ -8,6 +8,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
+import java.util.LinkedHashSet;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
@@ -103,7 +104,11 @@ public final class QuickJS implements AutoCloseable {
    * or writes again, await an owner execute barrier and ensure detached JS work
    * no longer uses the buffer. Returning a JS buffer to Java still creates byte[].
    */
-  public record DirectBuffer(ByteBuffer buffer) {
+  public record DirectBuffer(ByteBuffer buffer, boolean detachable) {
+
+    public DirectBuffer(ByteBuffer buffer) {
+      this(buffer, true);
+    }
 
     public DirectBuffer {
       Objects.requireNonNull(buffer, "buffer");
@@ -304,11 +309,23 @@ public final class QuickJS implements AutoCloseable {
       return call(args, true);
     }
 
+    /** Internal maintenance; cancellation and admission apply to user work, not cleanup. */
+    synchronized CompletableFuture<Object> callCleanup(Object... args) {
+      return call(args, true, true);
+    }
+
     private CompletableFuture<Object> call(Object[] args, boolean detached) {
+      return call(args, detached, false);
+    }
+
+    private CompletableFuture<Object> call(Object[] args, boolean detached, boolean cleanup) {
       if (closed) return failedFuture(new IllegalStateException("Callback is closed"));
       Object[] values = Objects.requireNonNull(args, "args").clone();
       return runtime.call(
-          (handle, callId) -> runtime.callback(handle, callId, id, values, detached));
+          (handle, callId) -> runtime.callback(handle, callId, id, values, detached),
+          null,
+          null,
+          cleanup);
     }
 
     @Override
@@ -371,6 +388,8 @@ public final class QuickJS implements AutoCloseable {
   private final Set<String> modules = new HashSet<>();
   private final Set<CompletableFuture<?>> submissions = new HashSet<>();
   private final ArrayList<Runnable> closeHooks = new ArrayList<>();
+  private final Set<Runnable> executionExitHooks = new LinkedHashSet<>();
+  private int executionDepth;
   private final CompletableFuture<Void> destroyed = new CompletableFuture<>();
   private volatile Thread ownerThread;
   private ModuleLoader moduleLoader;
@@ -981,8 +1000,60 @@ public final class QuickJS implements AutoCloseable {
         true);
   }
 
+  /** Internal maintenance after the outermost owner execution has left native code. */
+  void onExecutionExit(Runnable work) {
+    if (!isOwnerThread() || executionDepth == 0)
+      throw new IllegalStateException("Execution exit requires active owner work");
+    executionExitHooks.add(Objects.requireNonNull(work, "work"));
+  }
+
+  private void finishExecution() {
+    if (--executionDepth != 0 || executionExitHooks.isEmpty()) return;
+    ArrayList<Runnable> hooks = new ArrayList<>(executionExitHooks);
+    executionExitHooks.clear();
+    synchronized (lifecycle) {
+      if (closed) return;
+    }
+    Throwable failure = null;
+    for (Runnable hook : hooks) {
+      try {
+        hook.run();
+      } catch (Throwable error) {
+        if (failure == null) failure = error;
+        else if (failure != error) failure.addSuppressed(error);
+      }
+    }
+    if (failure != null) {
+      close(failure);
+      throw new CompletionException(failure);
+    }
+  }
+
   public boolean isOwnerThread() {
     return Thread.currentThread() == ownerThread;
+  }
+
+  Runnable interruptionCheck() {
+    if (!isOwnerThread())
+      throw new IllegalStateException("Interruption scope requires the owner thread");
+    ArrayList<CompletableFuture<Object>> owners = new ArrayList<>();
+    synchronized (lifecycle) {
+      if (closed) throw new RuntimeClosedException();
+      for (long id : scope(handle)) {
+        CompletableFuture<Object> owner = pending.get(id);
+        if (owner != null) owners.add(owner);
+      }
+      if (!inJobScope) owners.addAll(asyncOwners.values());
+    }
+    return () -> {
+      synchronized (lifecycle) {
+        if (closed) throw new RuntimeClosedException();
+      }
+      for (CompletableFuture<Object> owner : owners) {
+        if (owner.isCompletedExceptionally())
+          throw new CancellationException("JavaScript call canceled");
+      }
+    };
   }
 
   /**
@@ -1020,6 +1091,7 @@ public final class QuickJS implements AutoCloseable {
           synchronized (lifecycle) {
             if (closed || result.isDone()) return;
           }
+          executionDepth++;
           try {
             T value = work.call();
             if (moduleFailed)
@@ -1029,7 +1101,15 @@ public final class QuickJS implements AutoCloseable {
           } catch (Throwable error) {
             result.completeExceptionally(error);
           } finally {
-            if (moduleFailed) close();
+            try {
+              try {
+                finishExecution();
+              } catch (Throwable error) {
+                result.completeExceptionally(error);
+              }
+            } finally {
+              if (moduleFailed) close();
+            }
           }
         };
     boolean runInline;
@@ -1193,6 +1273,7 @@ public final class QuickJS implements AutoCloseable {
     synchronized (lifecycle) {
       if (closed || result.isDone() || timedOutCalls.contains(callId)) return;
     }
+    executionDepth++;
     try {
       try {
         if (before != null) before.accept(result);
@@ -1201,7 +1282,11 @@ public final class QuickJS implements AutoCloseable {
         try {
           if (after != null) after.run();
         } finally {
-          if (moduleFailed) close();
+          try {
+            finishExecution();
+          } finally {
+            if (moduleFailed) close();
+          }
         }
       }
     } catch (Throwable error) {

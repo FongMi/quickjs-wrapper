@@ -84,7 +84,7 @@ struct Runtime {
     jclass boolean_class, integer_class, short_class, byte_class, long_class, double_class, number_class;
     jclass string_class, bytes_class, array_class, object_class, bigint_class;
     jclass json_class, binary_class, text_class, byte_array_class, direct_buffer_class, callback_class, reference_class, transfer_class;
-    jfieldID direct_buffer_data;
+    jfieldID direct_buffer_data, direct_buffer_detachable;
     jmethodID dispatch_method, dispatch_async_method, complete_method, rejection_method, normalize_method, load_method, load_bytecode_method;
     jmethodID uncatchable_method;
     JSClassID job_scope_class = 0;
@@ -618,6 +618,7 @@ JSValue from_java(Runtime *rt, jobject value, int depth) {
         JSValue result = JS_NewArrayBuffer(ctx, size ? data : &empty, static_cast<size_t>(size),
                                           0, release_direct_buffer, lease, false);
         if (JS_IsException(result)) release_direct_buffer(rt->runtime, lease, data, 0);
+        else if (!env->GetBooleanField(value, rt->direct_buffer_detachable)) JS_SetArrayBufferDetachable(ctx, result, false);
         return result;
     }
     if (env->IsInstanceOf(value, rt->array_class)) {
@@ -1415,6 +1416,13 @@ JSValue reference_operation(Runtime *rt, const std::string &operation,
                             const std::vector<JSValue> &args, jobjectArray objects) {
     JSContext *ctx = rt->context;
     auto arity = [&](size_t count) { return args.size() == count; };
+    if (operation == "detachBuffer" && arity(1)) {
+        JSValue buffer = JS_GetPropertyStr(ctx, args[0], "buffer");
+        if (JS_IsException(buffer)) return buffer;
+        JS_DetachArrayBuffer(ctx, buffer);
+        JS_FreeValue(ctx, buffer);
+        return JS_UNDEFINED;
+    }
     if (operation == "global" && arity(0)) return JS_GetGlobalObject(ctx);
     if (operation == "receiver" && arity(0)) return JS_DupValue(ctx, rt->host_receiver);
     if (operation == "newObject" && arity(0)) return JS_NewObject(ctx);
@@ -1680,6 +1688,7 @@ extern "C" JNIEXPORT jlong JNICALL Java_com_fongmi_quickjs_QuickJS_create(JNIEnv
     if (!env->ExceptionCheck()) rt->callback_runtime = env->GetFieldID(rt->callback_class, "runtime", "Lcom/fongmi/quickjs/QuickJS;");
     if (!env->ExceptionCheck()) rt->reference_id = env->GetFieldID(rt->reference_class, "id", "J");
     if (!env->ExceptionCheck()) rt->reference_runtime = env->GetFieldID(rt->reference_class, "runtime", "Lcom/fongmi/quickjs/QuickJS;");
+    if (!env->ExceptionCheck()) rt->direct_buffer_detachable = env->GetFieldID(rt->direct_buffer_class, "detachable", "Z");
     if (!env->ExceptionCheck()) rt->direct_buffer_data = env->GetFieldID(rt->direct_buffer_class, "buffer", "Ljava/nio/ByteBuffer;");
     if (env->ExceptionCheck()) { destroy(rt); return 0; }
     rt->runtime = JS_NewRuntime();
