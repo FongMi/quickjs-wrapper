@@ -11,7 +11,9 @@
     function viewAccess(prototype) {
         return Object.fromEntries(['buffer', 'byteOffset', 'byteLength'].map(name => [name, Object.getOwnPropertyDescriptor(prototype, name).get]));
     }
-    const typedAccess = viewAccess(Object.getPrototypeOf(Uint8Array.prototype)), dataAccess = viewAccess(DataView.prototype);
+    const typedPrototype = Object.getPrototypeOf(ByteArray.prototype);
+    const typedAccess = viewAccess(typedPrototype), dataAccess = viewAccess(DataView.prototype);
+    const typedName = Object.getOwnPropertyDescriptor(typedPrototype, Symbol.toStringTag).get;
     function errorType(name) {
         function WasmError(message) { return Reflect.construct(Error, arguments, new.target || WasmError); }
         Object.setPrototypeOf(WasmError, Error);
@@ -58,7 +60,7 @@
             }
         }
         if (length > moduleLimits[0]) throw new RangeError('WASM module budget exhausted');
-        return new ByteArray(new ByteArray(buffer, offset, length)).buffer;
+        return typedAccess.buffer.call(new ByteArray(new ByteArray(buffer, offset, length)));
     }
     function index(value, max = 0xffffffff) {
         const number = +value;
@@ -426,8 +428,7 @@
             headers: getter(response, 'headers'), body: getter(body, 'body'), used: getter(body, 'bodyUsed'),
             header: Headers.prototype.get, reader: ReadableStream.prototype.getReader,
             read: ReadableStreamDefaultReader.prototype.read, cancel: ReadableStreamDefaultReader.prototype.cancel,
-            release: ReadableStreamDefaultReader.prototype.releaseLock,
-            byteLength: getter(Object.getPrototypeOf(Uint8Array.prototype), 'byteLength')};
+            release: ReadableStreamDefaultReader.prototype.releaseLock};
         return responseMethods;
     }
     function responseBody(response, methods) {
@@ -438,17 +439,17 @@
         if (methods.used.call(response)) throw new TypeError('WASM response body has already been used');
         return methods.body.call(response);
     }
-    function appendResponseChunk(state, value, methods) {
-        if (!(value instanceof Uint8Array)) throw new TypeError('WASM response body must contain Uint8Array chunks');
-        const length = methods.byteLength.call(value);
+    function appendResponseChunk(state, value) {
+        if (typedName.call(value) !== 'Uint8Array') throw new TypeError('WASM response body must contain Uint8Array chunks');
+        const length = typedAccess.byteLength.call(value);
         if (length > moduleLimits[0] - state.length) throw new RangeError('WASM streaming byte budget exhausted: module limit ' + moduleLimits[0]);
         if (length > moduleLimits[1] - loadingBytes) throw new RangeError('WASM streaming byte budget exhausted: aggregate limit ' + moduleLimits[1]);
-        const bytes = new Uint8Array(value);
+        const bytes = new ByteArray(value);
         let offset = 0;
         while (offset < length) {
             let tail = state.chunks[state.chunks.length - 1];
             if (!tail || state.used === tail.length) {
-                tail = new Uint8Array(Math.min(65536, moduleLimits[0] - state.length));
+                tail = new ByteArray(Math.min(65536, moduleLimits[0] - state.length));
                 state.chunks.push(tail);
                 state.used = 0;
             }
@@ -466,9 +467,9 @@
             const item = await methods.read.call(state.reader);
             if (state.canceled) return;
             if (item.done) break;
-            appendResponseChunk(state, item.value, methods);
+            appendResponseChunk(state, item.value);
         }
-        const binary = new Uint8Array(state.length);
+        const binary = new ByteArray(state.length);
         let offset = 0;
         for (const chunk of state.chunks) {
             const count = Math.min(chunk.length, binary.length - offset);

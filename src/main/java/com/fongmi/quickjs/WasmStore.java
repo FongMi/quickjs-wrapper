@@ -1,7 +1,10 @@
 package com.fongmi.quickjs;
 
+import com.dylibso.chicory.runtime.ImportValue;
 import com.dylibso.chicory.runtime.Instance;
+import com.dylibso.chicory.runtime.InterpreterMachine;
 import com.dylibso.chicory.runtime.TableInstance;
+import com.dylibso.chicory.wasm.InvalidException;
 import com.dylibso.chicory.wasm.types.MemoryLimits;
 import com.dylibso.chicory.wasm.types.Table;
 import java.lang.ref.PhantomReference;
@@ -10,6 +13,7 @@ import java.nio.ByteBuffer;
 import java.util.HashMap;
 import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.function.Consumer;
 
@@ -70,6 +74,38 @@ final class WasmStore implements WasmMemory.Allocator {
 
   WasmMemory memory(MemoryLimits limits) {
     return new WasmMemory(limits, this);
+  }
+
+  Instance instantiate(
+      WasmModuleInfo module,
+      List<ImportValue> imports,
+      Consumer<Instance> enter,
+      Consumer<Instance> leave,
+      Runnable poll) {
+    return Instance.builder(module.module)
+        .withMachineFactory(
+            owner -> {
+              InterpreterMachine machine = new InterpreterMachine(owner);
+              return (index, arguments) -> {
+                enter.accept(owner);
+                try {
+                  return machine.call(index, arguments);
+                } finally {
+                  leave.accept(owner);
+                }
+              };
+            })
+        .withImportValuesByIndex(imports)
+        .withMemoryFactory(
+            limits -> {
+              if (limits.shared()) throw new InvalidException("Shared WASM memory is disabled");
+              return memory(limits);
+            })
+        .withTableFactory(this::table)
+        .withUnsafeExecutionListener((instruction, stack) -> poll.run())
+        .withInitialize(false)
+        .withStart(false)
+        .build();
   }
 
   Integer id(Object object) {
