@@ -14,7 +14,6 @@ import com.dylibso.chicory.runtime.ImportMemory;
 import com.dylibso.chicory.runtime.ImportTable;
 import com.dylibso.chicory.runtime.ImportValue;
 import com.dylibso.chicory.runtime.Instance;
-import com.dylibso.chicory.runtime.InterpreterMachine;
 import com.dylibso.chicory.runtime.Memory;
 import com.dylibso.chicory.runtime.TableInstance;
 import com.dylibso.chicory.runtime.WasmRuntimeException;
@@ -171,11 +170,7 @@ public final class Wasm implements AutoCloseable {
       result.whenComplete(
           (value, error) -> {
             pendingLoads.remove(this);
-            if (result.isCancelled()) {
-              CompletableFuture<?> task = source;
-              if (task != null) task.cancel(true);
-              clean(true);
-            }
+            if (result.isCancelled()) abort();
           });
     }
 
@@ -186,14 +181,21 @@ public final class Wasm implements AutoCloseable {
         return result;
       }
       source = work.call();
-      source.whenComplete(
-          (value, error) -> {
-            clean(error != null || Boolean.FALSE.equals(value));
-            if (error == null) result.complete(value);
-            else result.completeExceptionally(error);
-          });
-      if (result.isCancelled()) source.cancel(true);
+      source.whenComplete(this::complete);
+      if (result.isCancelled()) abort();
       return result;
+    }
+
+    void complete(Object value, Throwable error) {
+      clean(error != null || Boolean.FALSE.equals(value));
+      if (error == null) result.complete(value);
+      else result.completeExceptionally(error);
+    }
+
+    void abort() {
+      CompletableFuture<?> task = source;
+      if (task != null) task.cancel(true);
+      clean(true);
     }
 
     void clean(boolean abort) {
@@ -592,27 +594,12 @@ public final class Wasm implements AutoCloseable {
 
     Object[] prepare() {
       instance =
-          Instance.builder(compiled.module)
-              .withMachineFactory(
-                  owner -> {
-                    InterpreterMachine machine = new InterpreterMachine(owner);
-                    return (index, arguments) -> {
-                      executions.element().enter(this);
-                      return machine.call(index, arguments);
-                    };
-                  })
-              .withImportValuesByIndex(imports)
-              .withMemoryFactory(
-                  limits -> {
-                    if (limits.shared())
-                      throw new InvalidException("Shared WASM memory is disabled");
-                    return store.memory(limits);
-                  })
-              .withTableFactory(store::table)
-              .withUnsafeExecutionListener((instruction, stack) -> poll())
-              .withInitialize(false)
-              .withStart(false)
-              .build();
+          store.instantiate(
+              compiled,
+              imports,
+              owner -> executions.element().enter(this),
+              owner -> {},
+              this::poll);
       instances.put(instance, this);
       return resources();
     }
