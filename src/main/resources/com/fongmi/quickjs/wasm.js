@@ -1,15 +1,24 @@
-(({host, connect, begin, detach}) => {
+(({host, connect, begin, detach, load, moduleLimits}) => {
     const modules = new WeakMap(), instances = new WeakMap(), memories = new WeakMap(), tables = new WeakMap(), globals = new WeakMap(), functions = new WeakMap();
     const nativeObjects = new Map(), states = new Map(), bufferOwners = new WeakMap();
     const frames = [], cells = new Map(), objectCells = new WeakMap();
     const cellCleanup = new FinalizationRegistry(id => cells.delete(id));
     let nextCell = 0;
+    let responseMethods, loadingBytes = 0, loadingCount = 0;
+    const ByteArray = Uint8Array, isView = ArrayBuffer.isView;
+    const bufferLength = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'byteLength').get;
+    const sharedLength = typeof SharedArrayBuffer === 'function' ? Object.getOwnPropertyDescriptor(SharedArrayBuffer.prototype, 'byteLength').get : null;
+    function viewAccess(prototype) {
+        return Object.fromEntries(['buffer', 'byteOffset', 'byteLength'].map(name => [name, Object.getOwnPropertyDescriptor(prototype, name).get]));
+    }
+    const typedAccess = viewAccess(Object.getPrototypeOf(Uint8Array.prototype)), dataAccess = viewAccess(DataView.prototype);
     function errorType(name) {
         function WasmError(message) { return Reflect.construct(Error, arguments, new.target || WasmError); }
         Object.setPrototypeOf(WasmError, Error);
         Object.setPrototypeOf(WasmError.prototype, Error.prototype);
         Object.defineProperty(WasmError, 'name', {value: name, configurable: true});
         Object.defineProperty(WasmError.prototype, 'name', {value: name, writable: true, configurable: true});
+        Object.defineProperty(WasmError, 'prototype', {writable: false});
         return WasmError;
     }
     const CompileError = errorType('CompileError'), LinkError = errorType('LinkError'), RuntimeError = errorType('RuntimeError');
@@ -34,9 +43,22 @@
         return value;
     }
     function bytes(value) {
-        if (value instanceof ArrayBuffer) return value.slice(0);
-        if (ArrayBuffer.isView(value)) return value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength);
-        throw new TypeError('WASM bytes require an ArrayBuffer or TypedArray');
+        let buffer = value, offset = 0, length;
+        if (isView(value)) {
+            let access = typedAccess;
+            try { buffer = access.buffer.call(value); }
+            catch { access = dataAccess; buffer = access.buffer.call(value); }
+            offset = access.byteOffset.call(value);
+            length = access.byteLength.call(value);
+        } else {
+            try { length = bufferLength.call(value); }
+            catch (error) {
+                if (!sharedLength) throw error;
+                length = sharedLength.call(value);
+            }
+        }
+        if (length > moduleLimits[0]) throw new RangeError('WASM module budget exhausted');
+        return new ByteArray(new ByteArray(buffer, offset, length)).buffer;
     }
     function index(value, max = 0xffffffff) {
         const number = +value;
@@ -194,7 +216,11 @@
             const [id, imports, exports] = run('compile', bytes(binary));
             own(this, id, modules, {imports, exports});
         }
-        static customSections(module, name) { return run('custom', slot(modules, module).id, String(name)); }
+        static customSections(module, name) {
+            const state = slot(modules, module);
+            if (arguments.length < 2) throw new TypeError('WASM custom section name is required');
+            return run('custom', state.id, `${name}`);
+        }
         static imports(module) { return slot(modules, module).imports.map(([module, name, kind]) => ({module, name, kind})); }
         static exports(module) { return slot(modules, module).exports.map(([name, kind]) => ({name, kind})); }
     }
@@ -261,7 +287,7 @@
     }
     class Global {
         constructor(descriptor, value) {
-            const type = valueType(descriptor.value), mutable = !!descriptor.mutable;
+            const mutable = !!descriptor.mutable, type = valueType(descriptor.value);
             if (value === undefined) value = type === 'i64' ? 0n : type === 'externref' ? undefined : 0;
             const encoded = encode(type, value);
             const [, id] = run('global', type, mutable, encoded);
@@ -276,7 +302,7 @@
             run('globalSet', state.id, encoded);
             if (state.type === 'externref') state.root = rootReference(encoded);
         }
-        valueOf() { return this.value; }
+        valueOf() { const state = slot(globals, this); return decode(state.type, run('globalGet', state.id)); }
     }
     function loadResources(state, descriptors) { for (const descriptor of descriptors) state.resources.add(resource(descriptor)); }
     function linkImports(state, imports) {
@@ -385,11 +411,123 @@
             const args = params.map((type, i) => decode(type, values[i]));
             const value = state.legacy ? state.imports[index](state.legacy, ...args) : state.imports[index](...args);
             if (state.legacy && value && typeof value.then === 'function') throw new TypeError('WASM imports must be synchronous');
-            const returned = results.length === 0 ? [] : results.length === 1 ? [value] : Array.from(value);
+            const returned = results.length === 0 ? [] : results.length === 1 ? [value] : [...value];
             if (returned.length !== results.length) throw new TypeError('Invalid WASM result count');
             return results.map((type, i) => encode(type, returned[i]));
         } catch (reason) { frames[frames.length - 1].failure = reason; return null; }
     });
+    function responseAccess() {
+        const constructor = globalThis.Response;
+        if (typeof constructor !== 'function') throw new TypeError('WASM streaming requires Response');
+        if (responseMethods?.constructor === constructor) return responseMethods;
+        const response = constructor.prototype, body = Object.getPrototypeOf(response);
+        const getter = (prototype, name) => Object.getOwnPropertyDescriptor(prototype, name).get;
+        responseMethods = {constructor, status: getter(response, 'status'), type: getter(response, 'type'),
+            headers: getter(response, 'headers'), body: getter(body, 'body'), used: getter(body, 'bodyUsed'),
+            header: Headers.prototype.get, reader: ReadableStream.prototype.getReader,
+            read: ReadableStreamDefaultReader.prototype.read, cancel: ReadableStreamDefaultReader.prototype.cancel,
+            release: ReadableStreamDefaultReader.prototype.releaseLock,
+            byteLength: getter(Object.getPrototypeOf(Uint8Array.prototype), 'byteLength')};
+        return responseMethods;
+    }
+    function responseBody(response, methods) {
+        const status = methods.status.call(response), type = methods.type.call(response);
+        const mime = methods.header.call(methods.headers.call(response), 'Content-Type');
+        if (status < 200 || status > 299 || ['error', 'opaque', 'opaqueredirect'].includes(type)) throw new TypeError('WASM streaming requires a successful response (status ' + status + ', type ' + type + ')');
+        if (mime === null || mime.replace(/^[\t ]+|[\t ]+$/g, '').toLowerCase() !== 'application/wasm') throw new TypeError('WASM response must have Content-Type application/wasm');
+        if (methods.used.call(response)) throw new TypeError('WASM response body has already been used');
+        return methods.body.call(response);
+    }
+    function appendResponseChunk(state, value, methods) {
+        if (!(value instanceof Uint8Array)) throw new TypeError('WASM response body must contain Uint8Array chunks');
+        const length = methods.byteLength.call(value);
+        if (length > moduleLimits[0] - state.length) throw new RangeError('WASM streaming byte budget exhausted: module limit ' + moduleLimits[0]);
+        if (length > moduleLimits[1] - loadingBytes) throw new RangeError('WASM streaming byte budget exhausted: aggregate limit ' + moduleLimits[1]);
+        const bytes = new Uint8Array(value);
+        let offset = 0;
+        while (offset < length) {
+            let tail = state.chunks[state.chunks.length - 1];
+            if (!tail || state.used === tail.length) {
+                tail = new Uint8Array(Math.min(65536, moduleLimits[0] - state.length));
+                state.chunks.push(tail);
+                state.used = 0;
+            }
+            const count = Math.min(tail.length - state.used, length - offset);
+            tail.set(bytes.subarray(offset, offset + count), state.used);
+            state.used += count;
+            state.length += count;
+            loadingBytes += count;
+            offset += count;
+        }
+    }
+    async function readResponse(state, body, methods) {
+        if (body) state.reader = methods.reader.call(body);
+        while (state.reader) {
+            const item = await methods.read.call(state.reader);
+            if (state.canceled) return;
+            if (item.done) break;
+            appendResponseChunk(state, item.value, methods);
+        }
+        const binary = new Uint8Array(state.length);
+        let offset = 0;
+        for (const chunk of state.chunks) {
+            const count = Math.min(chunk.length, binary.length - offset);
+            binary.set(chunk.subarray(0, count), offset);
+            offset += count;
+        }
+        return binary;
+    }
+    async function compileResponse(source) {
+        if (loadingCount >= 64) throw new RangeError('WASM streaming load budget exhausted');
+        loadingCount++;
+        const state = {reader: null, chunks: [], length: 0, used: 0, canceled: false, active: true};
+        let methods, result, failure, failed = false;
+        function finish() {
+            if (state.active) { state.active = false; loadingCount--; }
+        }
+        function release() {
+            loadingBytes -= state.length;
+            state.length = 0;
+            state.chunks.length = 0;
+            if (state.reader) {
+                methods.release.call(state.reader);
+                state.reader = null;
+            }
+        }
+        try {
+            await load(async () => {
+                try {
+                    const response = await source;
+                    if (state.canceled) return;
+                    methods = responseAccess();
+                    const binary = await readResponse(state, responseBody(response, methods), methods);
+                    if (state.canceled) return;
+                    release();
+                    result = new Module(binary);
+                } catch (error) {
+                    failure = error;
+                    failed = true;
+                }
+                return !failed;
+            }, () => {
+                state.canceled = true;
+                const reader = state.reader;
+                state.reader = null;
+                release();
+                finish();
+                if (reader) {
+                    try {
+                        return methods.cancel.call(reader, failed ? failure : undefined).catch(error => {
+                            if (!failed || error !== failure) throw error;
+                        });
+                    }
+                    finally { methods.release.call(reader); }
+                }
+            });
+            if (failed) throw failure;
+            return result;
+        } finally { release(); finish(); }
+    }
     const webAssembly = {Module, Instance, Memory, Table, Global, CompileError, LinkError, RuntimeError,
         validate(binary) {
             let module;
@@ -398,13 +536,19 @@
             finally { if (module) { const {id} = modules.get(module); cleanup.unregister(module); nativeObjects.delete(id); run('release', id); } }
         },
         async compile(binary) { return new Module(binary); },
+        async compileStreaming(source) { return compileResponse(source); },
+        async instantiateStreaming(source, imports) {
+            if (imports !== undefined && (imports === null || (typeof imports !== 'object' && typeof imports !== 'function'))) throw new TypeError('WASM imports require an object');
+            const module = await compileResponse(source);
+            return {module, instance: new Instance(module, imports)};
+        },
         async instantiate(binary, imports) {
             if (modules.has(binary)) return new Instance(binary, imports);
-            const module = new Module(binary);
+            const module = await new Module(binary);
             return {module, instance: new Instance(module, imports)};
         }
     };
-    for (const value of [Instance, Table, Global, webAssembly.instantiate]) Object.defineProperty(value, 'length', {value: 1, configurable: true});
+    for (const value of [Instance, Table, Global, Table.prototype.grow, Table.prototype.set, webAssembly.instantiate, webAssembly.instantiateStreaming]) Object.defineProperty(value, 'length', {value: 1, configurable: true});
     for (const [name, value] of Object.entries({Module, Instance, Memory, Table, Global})) Object.defineProperty(value.prototype, Symbol.toStringTag, {value: 'WebAssembly.' + name, configurable: true});
     Object.defineProperty(webAssembly, Symbol.toStringTag, {value: 'WebAssembly', configurable: true});
     for (const key of ['Module', 'Instance', 'Memory', 'Table', 'Global', 'CompileError', 'LinkError', 'RuntimeError']) Object.defineProperty(webAssembly, key, {enumerable: false});

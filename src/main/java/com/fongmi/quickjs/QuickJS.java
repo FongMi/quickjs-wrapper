@@ -1514,6 +1514,11 @@ public final class QuickJS implements AutoCloseable {
     return accepted && error == null;
   }
 
+  void reportUnhandledFailure(Throwable failure) {
+    Runnable report = () -> unhandledRejection(failure.toString());
+    continueOnOwner(() -> onExecutionExit(() -> continueOnOwner(report, false)), true);
+  }
+
   private void unhandledRejection(String message) {
     Consumer<ScriptException> listener;
     synchronized (lifecycle) {
