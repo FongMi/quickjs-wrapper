@@ -21,6 +21,7 @@ import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 
 final class WasmModuleInfo {
 
@@ -28,6 +29,13 @@ final class WasmModuleInfo {
   final int bytes;
   private final List<FunctionImport> functions;
   private final byte[] binary;
+
+  private WasmModuleInfo(WasmModuleInfo source) {
+    module = source.module;
+    bytes = source.bytes;
+    binary = source.binary;
+    functions = source.functions;
+  }
 
   private WasmModuleInfo(WasmModule module, byte[] binary, Runnable check) {
     this.module = module;
@@ -82,6 +90,7 @@ final class WasmModuleInfo {
 
   private void validateInstructions(Runnable check) {
     int instructions = 0;
+    int function = functions.size();
     for (FunctionBody body : module.codeSection().functionBodies()) {
       for (ValType value : body.localTypes()) name(value);
       for (var instruction : body.instructions()) {
@@ -95,21 +104,48 @@ final class WasmModuleInfo {
             || opcode == OpCode.RETURN_CALL
             || opcode == OpCode.RETURN_CALL_REF
             || opcode == OpCode.RETURN_CALL_INDIRECT)
-          throw new InvalidException("Unsupported WASM instruction: " + opcode);
+          throw unsupportedInstruction(
+              "Unsupported WASM instruction", opcode, function, instruction.address());
         if ((opcode == OpCode.TABLE_GET || opcode == OpCode.TABLE_SET)
             && tableType((int) instruction.operand(0)).equals(ValType.FuncRef))
-          throw new InvalidException("First-class WASM function references are not supported");
+          throw unsupportedInstruction(
+              "First-class WASM function references are not supported",
+              opcode,
+              function,
+              instruction.address());
       }
+      function++;
     }
+  }
+
+  private static InvalidException unsupportedInstruction(
+      String reason, OpCode opcode, int function, int address) {
+    return new InvalidException(
+        reason
+            + ": "
+            + opcode
+            + " at wasm-function["
+            + function
+            + "] offset 0x"
+            + Integer.toHexString(address));
   }
 
   static WasmModuleInfo parse(byte[] bytes, Runnable check) {
     WasmModule module =
         Parser.builder()
+            .withCustomParsers(Map.of())
             .withInterruptionCheck(check)
             .build()
             .parse(() -> new java.io.ByteArrayInputStream(bytes));
     return new WasmModuleInfo(module, bytes, check);
+  }
+
+  WasmModuleInfo copy() {
+    return new WasmModuleInfo(this);
+  }
+
+  ByteBuffer binaryKey() {
+    return ByteBuffer.wrap(binary).asReadOnlyBuffer();
   }
 
   Object[] customSections(String name, Runnable check) {

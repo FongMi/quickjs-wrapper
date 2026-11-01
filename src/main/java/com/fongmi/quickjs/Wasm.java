@@ -45,7 +45,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -58,6 +60,7 @@ public final class Wasm implements AutoCloseable {
   private final Deque<Runnable> executionChecks = new ArrayDeque<>();
   private final Deque<Execution> executions = new ArrayDeque<>();
   private final Map<Integer, Execution> pendingExecutions = new LinkedHashMap<>();
+  private final Set<Load> pendingLoads = ConcurrentHashMap.newKeySet();
   private final Runnable settleReferences = this::settleReferences;
   private final WasmStore store = new WasmStore(this::checkInterruption, this::memoryChanged);
   private final IdentityHashMap<Instance, Session> instances = new IdentityHashMap<>();
@@ -95,6 +98,7 @@ public final class Wasm implements AutoCloseable {
   private void install() {
     runtime.bind(name + "Host", this::command).join();
     runtime.bindReference(name + "Begin", this::begin).join();
+    runtime.bindAsync(name + "Load", this::load).join();
     runtime
         .bind(
             name + "Connect",
@@ -127,7 +131,13 @@ public final class Wasm implements AutoCloseable {
             + name
             + "Begin,detach:globalThis."
             + name
-            + "Detach}); } finally { delete globalThis."
+            + "Detach,load:globalThis."
+            + name
+            + "Load,moduleLimits:["
+            + WasmStore.MAX_MODULE
+            + ","
+            + WasmStore.MAX_MODULES
+            + "]}); } finally { delete globalThis."
             + name
             + "Host; delete globalThis."
             + name
@@ -135,8 +145,70 @@ public final class Wasm implements AutoCloseable {
             + name
             + "Begin; delete globalThis."
             + name
-            + "Detach; }";
+            + "Detach; delete globalThis."
+            + name
+            + "Load; }";
     api = (QuickJS.Reference) runtime.reference("evaluate", script, "<wasm>", false).join();
+  }
+
+  private CompletableFuture<?> load(Object[] args) {
+    Load load = new Load((QuickJS.Callback) args[0], (QuickJS.Callback) args[1]);
+    pendingLoads.add(load);
+    return load.start();
+  }
+
+  private final class Load {
+
+    final CompletableFuture<Object> result = new CompletableFuture<>();
+    final QuickJS.Callback work;
+    final QuickJS.Callback cancel;
+    final AtomicBoolean cleaned = new AtomicBoolean();
+    volatile CompletableFuture<Object> source;
+
+    Load(QuickJS.Callback work, QuickJS.Callback cancel) {
+      this.work = work;
+      this.cancel = cancel;
+      result.whenComplete(
+          (value, error) -> {
+            pendingLoads.remove(this);
+            if (result.isCancelled()) {
+              CompletableFuture<?> task = source;
+              if (task != null) task.cancel(true);
+              clean(true);
+            }
+          });
+    }
+
+    CompletableFuture<Object> start() {
+      if (closed.get()) {
+        clean(true);
+        result.completeExceptionally(new IllegalStateException("WASM runtime is closed"));
+        return result;
+      }
+      source = work.call();
+      source.whenComplete(
+          (value, error) -> {
+            clean(error != null || Boolean.FALSE.equals(value));
+            if (error == null) result.complete(value);
+            else result.completeExceptionally(error);
+          });
+      if (result.isCancelled()) source.cancel(true);
+      return result;
+    }
+
+    void clean(boolean abort) {
+      if (!cleaned.compareAndSet(false, true)) return;
+      if (abort) {
+        cancel
+            .callCleanup()
+            .whenComplete(
+                (ignored, failure) -> {
+                  if (failure != null) runtime.reportUnhandledFailure(failure);
+                });
+      }
+      work.close();
+      cancel.close();
+    }
   }
 
   private Object command(Object[] args) {
@@ -299,6 +371,7 @@ public final class Wasm implements AutoCloseable {
   }
 
   private void checkInterruption() {
+    if (closed.get()) throw new IllegalStateException("WASM runtime is closed");
     executionChecks.element().run();
   }
 
@@ -621,13 +694,14 @@ public final class Wasm implements AutoCloseable {
 
   private void dispose(boolean bindings) {
     closed.set(true);
+    for (Load load : pendingLoads) load.result.cancel(true);
     for (Execution execution : new ArrayList<>(pendingExecutions.values())) execution.close();
     store.clear();
     instances.clear();
     if (dispatcher != null) dispatcher.close();
     if (api != null) api.close();
     if (bindings)
-      for (String suffix : new String[] {"Host", "Connect", "Begin", "Detach"})
+      for (String suffix : new String[] {"Host", "Connect", "Begin", "Detach", "Load"})
         runtime.releaseBinding(name + suffix).join();
   }
 }

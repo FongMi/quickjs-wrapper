@@ -9,17 +9,21 @@ import java.lang.ref.ReferenceQueue;
 import java.nio.ByteBuffer;
 import java.util.HashMap;
 import java.util.IdentityHashMap;
+import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.function.Consumer;
 
 final class WasmStore implements WasmMemory.Allocator {
 
-  private static final int MAX_MODULE = 16 * 1024 * 1024;
-  private static final int MAX_MODULES = 32 * 1024 * 1024;
+  static final int MAX_MODULE = 16 * 1024 * 1024;
+  static final int MAX_MODULES = 32 * 1024 * 1024;
   private static final int MAX_MEMORY = 64 * 1024 * 1024;
   private static final int MAX_TOTAL_MEMORY = 128 * 1024 * 1024;
   private static final int MAX_TABLE = 32768;
   private static final int MAX_TOTAL_TABLE = 65536;
+  private static final int MAX_CACHED_MODULES = 8;
+  private static final int MAX_CACHED_BYTES = 2 * 1024 * 1024;
+  private final Map<ByteBuffer, WasmModuleInfo> compiled = new LinkedHashMap<>(16, .75f, true);
   private final Map<Integer, Object> handles = new HashMap<>();
   private final IdentityHashMap<Object, Integer> identities = new IdentityHashMap<>();
   private final ReferenceQueue<ByteBuffer> memoryQueue = new ReferenceQueue<>();
@@ -32,6 +36,7 @@ final class WasmStore implements WasmMemory.Allocator {
   private int moduleBytes;
   private int memoryBytes;
   private int tableElements;
+  private int cachedBytes;
 
   WasmStore(Runnable interruptionCheck, Consumer<WasmMemory> memoryChanged) {
     this.interruptionCheck = interruptionCheck;
@@ -41,7 +46,26 @@ final class WasmStore implements WasmMemory.Allocator {
   WasmModuleInfo compile(byte[] bytes) {
     if (bytes.length > MAX_MODULE || bytes.length > MAX_MODULES - moduleBytes)
       throw new WasmLimitException("WASM module budget exhausted");
-    return WasmModuleInfo.parse(bytes, interruptionCheck);
+    check();
+    WasmModuleInfo cached =
+        bytes.length > MAX_CACHED_BYTES ? null : compiled.get(ByteBuffer.wrap(bytes));
+    check();
+    if (cached != null) return cached.copy();
+    WasmModuleInfo module = WasmModuleInfo.parse(bytes.clone(), interruptionCheck);
+    check();
+    cache(module);
+    return module;
+  }
+
+  private void cache(WasmModuleInfo module) {
+    if (module.bytes > MAX_CACHED_BYTES) return;
+    var oldest = compiled.entrySet().iterator();
+    while (compiled.size() >= MAX_CACHED_MODULES || module.bytes > MAX_CACHED_BYTES - cachedBytes) {
+      cachedBytes -= oldest.next().getValue().bytes;
+      oldest.remove();
+    }
+    compiled.put(module.binaryKey(), module);
+    cachedBytes += module.bytes;
   }
 
   WasmMemory memory(MemoryLimits limits) {
@@ -170,10 +194,11 @@ final class WasmStore implements WasmMemory.Allocator {
   }
 
   void clear() {
+    compiled.clear();
     handles.clear();
     identities.clear();
     allocations.clear();
     tableAllocations.clear();
-    moduleBytes = memoryBytes = tableElements = 0;
+    moduleBytes = memoryBytes = tableElements = cachedBytes = 0;
   }
 }
