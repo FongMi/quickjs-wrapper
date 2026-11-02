@@ -33,7 +33,8 @@ public final class SharedMemoryGrowthContract {
     while (resource(observer, "sharedAllocations") != 0
         || resource(observer, "jniGlobalRefs") != roots) {
       check(System.nanoTime() < deadline, "Shared allocation or JNI root leaked");
-      System.gc();
+      // System.gc() alone defers collection on Android API 34 and lower.
+      Runtime.getRuntime().gc();
       Thread.sleep(10);
     }
     check(resource(observer, "sharedReservedBytes") == 0, "Reserved address space released");
@@ -134,7 +135,7 @@ public final class SharedMemoryGrowthContract {
       long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
       while (borrowed.owner().get() != null) {
         check(System.nanoTime() < deadline, "Borrow does not retain the Java owner");
-        System.gc();
+        Runtime.getRuntime().gc();
         Thread.sleep(10);
       }
       borrowed.bytes().putInt(0, 42);
@@ -236,7 +237,7 @@ public final class SharedMemoryGrowthContract {
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
         while (owner.get() != null) {
           check(System.nanoTime() < deadline, "Java shared owner became collectable");
-          System.gc();
+          Runtime.getRuntime().gc();
           Thread.sleep(10);
         }
         charged(budget);
@@ -266,7 +267,7 @@ public final class SharedMemoryGrowthContract {
           break;
         } catch (WasmLimitException pendingGc) {
           check(System.nanoTime() < deadline, "Last native owner refunds committed quota");
-          System.gc();
+          Runtime.getRuntime().gc();
           Thread.sleep(10);
         }
       }
@@ -281,7 +282,7 @@ public final class SharedMemoryGrowthContract {
     try {
       view.use(
           bytes -> {
-            System.gc();
+            Runtime.getRuntime().gc();
             bytes.putInt(0, 42);
             throw failure;
           });

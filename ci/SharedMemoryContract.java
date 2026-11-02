@@ -238,7 +238,7 @@ public final class SharedMemoryContract {
           throw new AssertionError("WASM wait missed deadline");
         } catch (TimeoutException expected) {
         }
-        System.gc();
+        Runtime.getRuntime().gc();
         check(instance.call("add", 1)[0].equals(0), "WASM recovery after deadline and GC");
         try {
           js.evaluateTimed(40, "Atomics.wait(new Int32Array(memory.buffer),0,1)", "<shared-wait>")
@@ -315,7 +315,7 @@ public final class SharedMemoryContract {
         java.close();
         wasm.close();
         shared = null;
-        System.gc();
+        Runtime.getRuntime().gc();
         js.reference("gc").get(5, TimeUnit.SECONDS);
         check(
             ((Number) js(js, "Atomics.load(new Int32Array(lastView),0)")).intValue() == 2,
@@ -325,7 +325,7 @@ public final class SharedMemoryContract {
       while ((resource(observer, "jniGlobalRefs") != roots
               || resource(observer, "sharedAllocations") != 0)
           && System.nanoTime() < releasedBy) {
-        System.gc();
+        Runtime.getRuntime().gc();
         Thread.sleep(10);
       }
       check(resource(observer, "jniGlobalRefs") == roots, "Shared JNI roots released after GC");
