@@ -16,6 +16,7 @@ public final class SharedMemoryGrowthContract {
 
   private static final int PAGE = 65536;
   private static final int MAX = 64 * 1024 * 1024;
+  private static final InheritableThreadLocal<Object[]> CONTEXT = new InheritableThreadLocal<>();
 
   private static void check(boolean condition, String message) {
     if (!condition) throw new AssertionError(message);
@@ -87,6 +88,126 @@ public final class SharedMemoryGrowthContract {
       } catch (WasmRuntime.LimitException expected) {
       }
     }
+  }
+
+  private static WeakReference<SharedMemory> callerContext() {
+    Object[] context = new Object[1];
+    CONTEXT.set(context);
+    try {
+      SharedMemory memory = SharedMemory.allocate(1, 4);
+      context[0] = memory;
+      return new WeakReference<>(memory);
+    } finally {
+      CONTEXT.remove();
+    }
+  }
+
+  private static void isolatedReaper(QuickJS observer, long roots) throws Exception {
+    WeakReference<SharedMemory> memory = callerContext();
+    released(observer, roots);
+    check(memory.get() == null, "Reaper must not retain inherited caller context");
+  }
+
+  private static void bootstrapFailure(QuickJS observer, long roots) throws Exception {
+    var start = QuickJS.class.getDeclaredMethod("bootstrapThread0", Runnable.class);
+    start.setAccessible(true);
+    var failure = new IllegalStateException("Reaper bootstrap failed");
+    CONTEXT.set(new Object[] {failure});
+    try {
+      start.invoke(
+          null,
+          (Runnable)
+              () -> {
+                check(CONTEXT.get() == null, "Native bootstrap must not inherit caller locals");
+                throw failure;
+              });
+      throw new AssertionError("Bootstrap swallowed the original failure");
+    } catch (InvocationTargetException error) {
+      check(error.getCause() == failure, "Bootstrap preserves the original exception");
+    } finally {
+      CONTEXT.remove();
+    }
+    check(resource(observer, "jniGlobalRefs") == roots, "Failed bootstrap releases JNI roots");
+  }
+
+  private static WeakReference<QuickJS.BufferLease> inheritedLease() throws Exception {
+    Object[] context = new Object[1];
+    try (QuickJS runtime = new QuickJS();
+        var reference =
+            (QuickJS.Reference)
+                runtime
+                    .reference(
+                        "evaluateReference", "new SharedArrayBuffer(8)", "<inherited-lease>", false)
+                    .get(5, TimeUnit.SECONDS)) {
+      runtime.execute(() -> CONTEXT.set(context)).get(5, TimeUnit.SECONDS);
+      try {
+        var lease = runtime.leaseBuffer(reference).get(5, TimeUnit.SECONDS);
+        context[0] = lease;
+        return new WeakReference<>(lease);
+      } finally {
+        runtime.execute(CONTEXT::remove).get(5, TimeUnit.SECONDS);
+      }
+    }
+  }
+
+  private static WeakReference<SharedMemory> inheritedDeadline() throws Exception {
+    Object[] context = new Object[1];
+    CONTEXT.set(context);
+    try (QuickJS runtime = new QuickJS()) {
+      check(
+          ((Number)
+                      runtime
+                          .evaluateTimed(5000, "42", "<inherited-deadline>")
+                          .get(5, TimeUnit.SECONDS))
+                  .intValue()
+              == 42,
+          "Timed call completes");
+      SharedMemory memory = SharedMemory.allocate(1, 4);
+      context[0] = memory;
+      return new WeakReference<>(memory);
+    } finally {
+      CONTEXT.remove();
+    }
+  }
+
+  private static WeakReference<QuickJS.BufferLease> inheritedOwner() throws Exception {
+    Object[] context = new Object[1];
+    ClassLoader previous = Thread.currentThread().getContextClassLoader();
+    ClassLoader loader = new ClassLoader(previous) {};
+    Thread.currentThread().setContextClassLoader(loader);
+    CONTEXT.set(context);
+    try (QuickJS runtime = new QuickJS();
+        var reference =
+            (QuickJS.Reference)
+                runtime
+                    .reference(
+                        "evaluateReference", "new SharedArrayBuffer(8)", "<inherited-owner>", false)
+                    .get(5, TimeUnit.SECONDS)) {
+      check(
+          runtime
+              .submit(() -> Thread.currentThread().getContextClassLoader() == loader)
+              .get(5, TimeUnit.SECONDS),
+          "Owner preserves caller context ClassLoader");
+      var lease = runtime.leaseBuffer(reference).get(5, TimeUnit.SECONDS);
+      context[0] = lease;
+      return new WeakReference<>(lease);
+    } finally {
+      CONTEXT.remove();
+      Thread.currentThread().setContextClassLoader(previous);
+    }
+  }
+
+  private static void infrastructureGc(QuickJS observer, long roots) throws Exception {
+    var lease = inheritedLease();
+    released(observer, roots);
+    check(lease.get() == null, "Buffer reaper must not retain inherited owner context");
+    var memory = inheritedDeadline();
+    released(observer, roots);
+    check(memory.get() == null, "Deadline worker must not retain inherited caller context");
+    var ownerLease = inheritedOwner();
+    released(observer, roots);
+    check(
+        ownerLease.get() == null, "Closed runtime owner must not retain inherited caller context");
   }
 
   private static void mixedQuota() throws Exception {
@@ -320,6 +441,9 @@ public final class SharedMemoryGrowthContract {
   public static void main(String[] args) throws Exception {
     try (QuickJS observer = new QuickJS()) {
       long roots = resource(observer, "jniGlobalRefs");
+      bootstrapFailure(observer, roots);
+      isolatedReaper(observer, roots);
+      infrastructureGc(observer, roots);
       sparseQuota(observer);
       released(observer, roots);
       mixedQuota();

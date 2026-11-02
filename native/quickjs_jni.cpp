@@ -12,6 +12,8 @@
 #include <mutex>
 #include <new>
 #include <string>
+#include <system_error>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -2106,4 +2108,59 @@ extern "C" JNIEXPORT void JNICALL Java_com_fongmi_quickjs_QuickJS_destroy(
     Runtime *rt = get(handle);
     rt->env = env;
     destroy(rt);
+}
+
+extern "C" JNIEXPORT void JNICALL Java_com_fongmi_quickjs_QuickJS_bootstrapThread0(
+    JNIEnv *env, jclass, jobject bootstrap) {
+    if (!bootstrap) {
+        jclass type = env->FindClass("java/lang/IllegalArgumentException");
+        if (type) { env->ThrowNew(type, "Thread bootstrap is required"); env->DeleteLocalRef(type); }
+        return;
+    }
+    jclass runnable = env->FindClass("java/lang/Runnable");
+    if (!runnable) return;
+    jmethodID start = env->GetMethodID(runnable, "run", "()V");
+    env->DeleteLocalRef(runnable);
+    if (!start) return;
+    jobject root = new_global_ref(env, bootstrap);
+    if (!root) return;
+    JavaVM *vm = nullptr;
+    env->GetJavaVM(&vm);
+    bool attached = false, failed = false;
+    jthrowable failure = nullptr;
+    try {
+        // Java Thread constructors inherit caller locals even on Android API 24.
+        // A temporary attached thread creates infrastructure threads from an empty context.
+        std::thread([&] {
+            JNIEnv *worker = nullptr;
+#ifdef __ANDROID__
+            attached = vm->AttachCurrentThreadAsDaemon(&worker, nullptr) == JNI_OK;
+#else
+            attached = vm->AttachCurrentThreadAsDaemon(reinterpret_cast<void **>(&worker), nullptr) == JNI_OK;
+#endif
+            if (!attached) return;
+            worker->CallVoidMethod(root, start);
+            if (worker->ExceptionCheck()) {
+                failed = true;
+                jthrowable error = worker->ExceptionOccurred();
+                worker->ExceptionClear();
+                failure = static_cast<jthrowable>(new_global_ref(worker, error));
+                if (!failure) worker->ExceptionClear();
+                worker->DeleteLocalRef(error);
+            }
+            vm->DetachCurrentThread();
+        }).join();
+    } catch (const std::system_error &) {
+        failed = true;
+    } catch (const std::bad_alloc &) {
+        failed = true;
+    }
+    delete_global_ref(env, root);
+    if (failure) {
+        env->Throw(failure);
+        delete_global_ref(env, failure);
+    } else if (!attached || failed) {
+        jclass type = env->FindClass("java/lang/OutOfMemoryError");
+        if (type) { env->ThrowNew(type, "Cannot create runtime infrastructure thread"); env->DeleteLocalRef(type); }
+    }
 }
