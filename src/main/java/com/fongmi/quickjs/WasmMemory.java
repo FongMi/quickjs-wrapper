@@ -132,35 +132,41 @@ class WasmMemory implements Memory {
   }
 
   public void write(int addr, byte[] data, int offset, int size) {
-    bounds(addr, size);
-    bounds(offset, size, data.length);
-    ByteBuffer view = buffer.duplicate();
-    view.position(addr);
-    view.put(data, offset, size);
+    try (var pin = shared == null ? null : shared.pin()) {
+      bounds(addr, size);
+      bounds(offset, size, data.length);
+      ByteBuffer view = buffer.duplicate();
+      view.position(addr);
+      view.put(data, offset, size);
+    }
   }
 
   public byte[] readBytes(int addr, int length) {
-    bounds(addr, length);
-    byte[] result = new byte[length];
-    ByteBuffer view = buffer.duplicate();
-    view.position(addr);
-    view.get(result);
-    return result;
+    try (var pin = shared == null ? null : shared.pin()) {
+      bounds(addr, length);
+      byte[] result = new byte[length];
+      ByteBuffer view = buffer.duplicate();
+      view.position(addr);
+      view.get(result);
+      return result;
+    }
   }
 
   public void copy(int dest, int src, int size) {
-    bounds(dest, size);
-    bounds(src, size);
-    if (dest > src && dest - src < size)
-      for (int i = size - 1; i >= 0; i--) {
-        if ((i & 16383) == 0) allocator.check();
-        buffer.put(dest + i, buffer.get(src + i));
-      }
-    else
-      for (int i = 0; i < size; i++) {
-        if ((i & 16383) == 0) allocator.check();
-        buffer.put(dest + i, buffer.get(src + i));
-      }
+    try (var pin = shared == null ? null : shared.pin()) {
+      bounds(dest, size);
+      bounds(src, size);
+      if (dest > src && dest - src < size)
+        for (int i = size - 1; i >= 0; i--) {
+          if ((i & 16383) == 0) allocator.check();
+          buffer.put(dest + i, buffer.get(src + i));
+        }
+      else
+        for (int i = 0; i < size; i++) {
+          if ((i & 16383) == 0) allocator.check();
+          buffer.put(dest + i, buffer.get(src + i));
+        }
+    }
   }
 
   public void zero() {
@@ -168,10 +174,12 @@ class WasmMemory implements Memory {
   }
 
   public void fill(byte value, int start, int end) {
-    bounds(start, end - start);
-    for (int i = start; i < end; i++) {
-      if ((i & 16383) == 0) allocator.check();
-      buffer.put(i, value);
+    try (var pin = shared == null ? null : shared.pin()) {
+      bounds(start, end - start);
+      for (int i = start; i < end; i++) {
+        if ((i & 16383) == 0) allocator.check();
+        buffer.put(i, value);
+      }
     }
   }
 
@@ -196,63 +204,87 @@ class WasmMemory implements Memory {
   }
 
   public void writeByte(int addr, byte value) {
-    bounds(addr, 1);
-    buffer.put(addr, value);
+    try (var pin = shared == null ? null : shared.pin()) {
+      bounds(addr, 1);
+      buffer.put(addr, value);
+    }
   }
 
   public void writeShort(int addr, short value) {
-    bounds(addr, 2);
-    buffer.putShort(addr, value);
+    try (var pin = shared == null ? null : shared.pin()) {
+      bounds(addr, 2);
+      buffer.putShort(addr, value);
+    }
   }
 
   public void writeI32(int addr, int value) {
-    bounds(addr, 4);
-    buffer.putInt(addr, value);
+    try (var pin = shared == null ? null : shared.pin()) {
+      bounds(addr, 4);
+      buffer.putInt(addr, value);
+    }
   }
 
   public void writeLong(int addr, long value) {
-    bounds(addr, 8);
-    buffer.putLong(addr, value);
+    try (var pin = shared == null ? null : shared.pin()) {
+      bounds(addr, 8);
+      buffer.putLong(addr, value);
+    }
   }
 
   public void writeF32(int addr, float value) {
-    bounds(addr, 4);
-    buffer.putFloat(addr, value);
+    try (var pin = shared == null ? null : shared.pin()) {
+      bounds(addr, 4);
+      buffer.putFloat(addr, value);
+    }
   }
 
   public void writeF64(int addr, double value) {
-    bounds(addr, 8);
-    buffer.putDouble(addr, value);
+    try (var pin = shared == null ? null : shared.pin()) {
+      bounds(addr, 8);
+      buffer.putDouble(addr, value);
+    }
   }
 
   public byte read(int addr) {
-    bounds(addr, 1);
-    return buffer.get(addr);
+    try (var pin = shared == null ? null : shared.pin()) {
+      bounds(addr, 1);
+      return buffer.get(addr);
+    }
   }
 
   public short readShort(int addr) {
-    bounds(addr, 2);
-    return buffer.getShort(addr);
+    try (var pin = shared == null ? null : shared.pin()) {
+      bounds(addr, 2);
+      return buffer.getShort(addr);
+    }
   }
 
   public int readInt(int addr) {
-    bounds(addr, 4);
-    return buffer.getInt(addr);
+    try (var pin = shared == null ? null : shared.pin()) {
+      bounds(addr, 4);
+      return buffer.getInt(addr);
+    }
   }
 
   public long readLong(int addr) {
-    bounds(addr, 8);
-    return buffer.getLong(addr);
+    try (var pin = shared == null ? null : shared.pin()) {
+      bounds(addr, 8);
+      return buffer.getLong(addr);
+    }
   }
 
   public float readFloat(int addr) {
-    bounds(addr, 4);
-    return buffer.getFloat(addr);
+    try (var pin = shared == null ? null : shared.pin()) {
+      bounds(addr, 4);
+      return buffer.getFloat(addr);
+    }
   }
 
   public double readDouble(int addr) {
-    bounds(addr, 8);
-    return buffer.getDouble(addr);
+    try (var pin = shared == null ? null : shared.pin()) {
+      bounds(addr, 8);
+      return buffer.getDouble(addr);
+    }
   }
 
   public long readU16(int addr) {

@@ -99,8 +99,8 @@ final class WasmStore implements WasmMemory.Allocator {
 
   WasmMemory memory(MemoryLimits limits) {
     if (!limits.shared()) return new WasmMemory(limits, this);
-    SharedMemory.requireNative();
-    return memory(new SharedMemory(limits, allocate(SharedMemory.capacity(limits))));
+    check();
+    return memory(SharedMemory.allocate(limits, memoryBudget));
   }
 
   WasmMemory memory(SharedMemory memory) {

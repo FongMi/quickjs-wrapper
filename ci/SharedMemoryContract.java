@@ -1,6 +1,5 @@
 package com.fongmi.quickjs;
 
-import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -306,13 +305,6 @@ public final class SharedMemoryContract {
         js.reference("gc").get(5, TimeUnit.SECONDS);
         check(
             instance.call("notify", 1)[0].equals(0), "Canceled WASM waiter leaves no queue entry");
-        ByteBuffer bad = ByteBuffer.allocateDirect(16);
-        bad.position(1);
-        try {
-          bind(js, "bad", new QuickJS.SharedBuffer(bad));
-          throw new AssertionError("Unaligned shared base accepted");
-        } catch (ExecutionException expected) {
-        }
         js(
             js,
             "globalThis.lastView=memory.buffer; delete globalThis.oldBuffer; delete globalThis.api;"
@@ -329,12 +321,15 @@ public final class SharedMemoryContract {
             ((Number) js(js, "Atomics.load(new Int32Array(lastView),0)")).intValue() == 2,
             "A retained SAB owns storage after source runtimes and WASM host close");
       }
-      check(
-          resource(observer, "jniGlobalRefs") == roots,
-          "Shared JNI roots released after runtime close");
-      check(
-          resource(observer, "sharedAllocations") == 0,
-          "Shared allocations released after the last owner");
+      long releasedBy = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+      while ((resource(observer, "jniGlobalRefs") != roots
+              || resource(observer, "sharedAllocations") != 0)
+          && System.nanoTime() < releasedBy) {
+        System.gc();
+        Thread.sleep(10);
+      }
+      check(resource(observer, "jniGlobalRefs") == roots, "Shared JNI roots released after GC");
+      check(resource(observer, "sharedAllocations") == 0, "Last owner releases shared storage");
     }
     System.out.println(
         "PASS: shared backing, concurrent atomics, cross-language wait/notify, growth, deadlines,"

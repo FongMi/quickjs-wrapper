@@ -14,8 +14,6 @@ int64_t shared_buffer_roots();
 size_t shared_buffer_allocations();
 size_t shared_reserved_bytes();
 size_t shared_committed_bytes();
-jobject allocate_shared_memory(JNIEnv *env, jint capacity, jint size, jobject charge);
-bool grow_shared_memory(JNIEnv *env, jobject storage, jint size);
 bool retain_shared_buffer(void *data);
 void release_shared_buffer(void *data);
 
