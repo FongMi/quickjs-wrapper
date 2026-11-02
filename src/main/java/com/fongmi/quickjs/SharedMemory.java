@@ -32,7 +32,7 @@ public final class SharedMemory {
 
     private static final ReferenceQueue<SharedMemory> QUEUE = new ReferenceQueue<>();
     private static final Set<Cleanup> LIVE = new HashSet<>();
-    private static Thread thread;
+    private static boolean running;
     private final ByteBuffer storage;
 
     Cleanup(SharedMemory memory, ByteBuffer storage) {
@@ -41,15 +41,13 @@ public final class SharedMemory {
       synchronized (LIVE) {
         try {
           LIVE.add(this);
-          if (thread == null) {
-            thread = new Thread(Cleanup::reap, "QuickJS-shared-memory");
-            thread.setDaemon(true);
-            thread.start();
+          if (!running) {
+            QuickJS.infrastructureThread(Cleanup::reap, "QuickJS-shared-memory").start();
+            running = true;
           }
         } catch (RuntimeException | Error error) {
           LIVE.remove(this);
           clear();
-          if (thread != null && !thread.isAlive()) thread = null;
           throw error;
         }
       }
@@ -59,7 +57,7 @@ public final class SharedMemory {
       while (true) {
         synchronized (LIVE) {
           if (LIVE.isEmpty()) {
-            thread = null;
+            running = false;
             return;
           }
         }

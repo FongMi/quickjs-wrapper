@@ -26,6 +26,7 @@ import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
 
@@ -45,12 +46,7 @@ public final class QuickJS implements AutoCloseable {
     private static ScheduledThreadPoolExecutor timer() {
       ScheduledThreadPoolExecutor result =
           new ScheduledThreadPoolExecutor(
-              1,
-              work -> {
-                Thread thread = new Thread(work, "QuickJS-deadlines");
-                thread.setDaemon(true);
-                return thread;
-              });
+              1, work -> infrastructureThread(work, "QuickJS-deadlines"));
       result.setRemoveOnCancelPolicy(true);
       return result;
     }
@@ -270,7 +266,7 @@ public final class QuickJS implements AutoCloseable {
 
     static {
       Thread thread =
-          new Thread(
+          infrastructureThread(
               () -> {
                 while (true) {
                   try {
@@ -282,7 +278,6 @@ public final class QuickJS implements AutoCloseable {
                 }
               },
               "QuickJS-buffer-reaper");
-      thread.setDaemon(true);
       thread.start();
     }
   }
@@ -1695,6 +1690,20 @@ public final class QuickJS implements AutoCloseable {
     if (failure == null) destroyed.complete(null);
     else destroyed.completeExceptionally(failure);
   }
+
+  // Long-lived infrastructure must not retain a caller's inherited thread locals.
+  static Thread infrastructureThread(Runnable work, String name) {
+    AtomicReference<Thread> result = new AtomicReference<>();
+    bootstrapThread0(
+        () -> {
+          Thread thread = new Thread(work, name);
+          thread.setDaemon(true);
+          result.set(thread);
+        });
+    return result.get();
+  }
+
+  private static native void bootstrapThread0(Runnable bootstrap);
 
   static native void writeConsole(int priority, byte[] message);
 
