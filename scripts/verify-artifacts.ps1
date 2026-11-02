@@ -25,14 +25,6 @@ try {
     if ($api.Entries | Where-Object { $_.FullName -match '\.(so|dll|dylib)$' }) { throw 'Java API JAR contains a native runtime.' }
 } finally { $api.Dispose() }
 
-$javap = if ($env:JAVA_HOME) { Join-Path $env:JAVA_HOME $(if ($IsWindows) { 'bin/javap.exe' } else { 'bin/javap' }) } else { 'javap' }
-$declarations = & $javap -private -classpath $JavaJar com.fongmi.quickjs.QuickJS
-if ($LASTEXITCODE) { throw 'Java native API inspection failed.' }
-$expectedJni = @($declarations | ForEach-Object {
-    if ($_ -match '\bnative\s+\S+\s+(\w+)\(') { 'Java_com_fongmi_quickjs_QuickJS_' + $Matches[1] }
-})
-if (!$expectedJni.Count) { throw 'Java API JAR has no native declarations.' }
-
 $verificationDirectory = Join-Path $repository 'build/artifact-verification'
 New-Item -ItemType Directory -Force -Path $verificationDirectory | Out-Null
 $runtime = [IO.Compression.ZipFile]::OpenRead($RuntimeAar)
@@ -73,12 +65,8 @@ try {
         if ($machine -notmatch ":\s+$expectedMachine$") { throw "Unexpected ABI: $abi $machine" }
         $symbols = & $readelf --dyn-syms --wide $nativeFile
         if ($LASTEXITCODE) { throw "JNI inspection failed for $abi." }
-        $actualJni = @($symbols | ForEach-Object {
-            if ($_ -match '\b(Java_com_fongmi_quickjs_QuickJS_\w+)$') { $Matches[1] }
-        })
-        if (Compare-Object $expectedJni $actualJni) { throw "Java/native JNI exports do not match for $abi." }
-        if ($symbols -match 'Java_com_whl_') { throw "Previous JNI namespace is present for $abi." }
-        Write-Output "$abi verified: $machine, $($expectedJni.Count) JNI methods, all LOAD segments aligned to at least 16 KB"
+        & "$PSScriptRoot/verify-jni.ps1" -JavaJar $JavaJar -Symbols $symbols
+        Write-Output "$abi verified: $machine, matching JNI methods, all LOAD segments aligned to at least 16 KB"
     }
 } finally { $runtime.Dispose() }
 

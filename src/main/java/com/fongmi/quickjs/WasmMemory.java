@@ -12,7 +12,7 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 
 @SuppressWarnings("removal")
-final class WasmMemory implements Memory {
+class WasmMemory implements Memory {
 
   interface Allocator {
     ByteBuffer allocate(long size);
@@ -24,22 +24,40 @@ final class WasmMemory implements Memory {
 
   private final MemoryLimits limits;
   private final Allocator allocator;
+  private final SharedMemory shared;
   private ByteBuffer buffer;
   private DataSegment[] segments = new DataSegment[0];
 
   WasmMemory(MemoryLimits limits, Allocator allocator) {
+    this(limits, allocator, null);
+  }
+
+  WasmMemory(MemoryLimits limits, Allocator allocator, SharedMemory shared) {
     this.limits = limits;
     this.allocator = allocator;
+    this.shared = shared;
     buffer =
-        allocator.allocate((long) limits.initialPages() * PAGE_SIZE).order(ByteOrder.LITTLE_ENDIAN);
+        shared == null
+            ? allocator
+                .allocate((long) limits.initialPages() * PAGE_SIZE)
+                .order(ByteOrder.LITTLE_ENDIAN)
+            : shared.storage();
+  }
+
+  SharedMemory backing() {
+    return shared;
+  }
+
+  private int byteSize() {
+    return pages() * PAGE_SIZE;
   }
 
   ByteBuffer buffer() {
-    return buffer.duplicate().order(ByteOrder.LITTLE_ENDIAN);
+    return shared == null ? buffer.duplicate().order(ByteOrder.LITTLE_ENDIAN) : shared.view();
   }
 
   public int pages() {
-    return buffer.capacity() / PAGE_SIZE;
+    return shared == null ? buffer.capacity() / PAGE_SIZE : shared.pages();
   }
 
   public int initialPages() {
@@ -51,10 +69,15 @@ final class WasmMemory implements Memory {
   }
 
   public boolean shared() {
-    return false;
+    return shared != null;
   }
 
   public int grow(int delta) {
+    if (shared != null) {
+      int previous = shared.grow(delta);
+      if (previous >= 0) allocator.changed(this);
+      return previous;
+    }
     int previous = pages();
     if (delta < 0 || delta > maximumPages() - previous) return -1;
     if (delta == 0) {
@@ -80,7 +103,7 @@ final class WasmMemory implements Memory {
   }
 
   private void bounds(int offset, int length) {
-    bounds(offset, length, buffer.capacity());
+    bounds(offset, length, byteSize());
   }
 
   public void initialize(Instance instance, DataSegment[] values) {
@@ -141,7 +164,7 @@ final class WasmMemory implements Memory {
   }
 
   public void zero() {
-    fill((byte) 0, 0, buffer.capacity());
+    fill((byte) 0, 0, byteSize());
   }
 
   public void fill(byte value, int start, int end) {
@@ -153,19 +176,23 @@ final class WasmMemory implements Memory {
   }
 
   public Object lock(int address) {
-    throw new UnsupportedOperationException("Shared WASM memory is disabled");
+    return this;
   }
 
   public int waitOn(int address, int expected, long timeout) {
-    throw new UnsupportedOperationException("Shared WASM memory is disabled");
+    bounds(address, 4);
+    throw new WasmRuntimeException("atomic wait requires shared memory");
   }
 
   public int waitOn(int address, long expected, long timeout) {
-    throw new UnsupportedOperationException("Shared WASM memory is disabled");
+    bounds(address, 8);
+    throw new WasmRuntimeException("atomic wait requires shared memory");
   }
 
   public int notify(int address, int count) {
-    throw new UnsupportedOperationException("Shared WASM memory is disabled");
+    bounds(address, 4);
+    if ((address & 3) != 0) throw new WasmRuntimeException("unaligned atomic");
+    return 0;
   }
 
   public void writeByte(int addr, byte value) {

@@ -1,6 +1,8 @@
 #include <jni.h>
 #include <quickjs.h>
+#include "com_fongmi_quickjs_QuickJS.h"
 #include "buffer_lease.h"
+#include "shared_memory.h"
 
 #include <algorithm>
 #include <atomic>
@@ -52,12 +54,14 @@ struct BufferRange {
     SharedAllocation *allocation;
     uint8_t *data;
     size_t length;
+    void *shared = nullptr;
 };
 
 struct Runtime {
     JNIEnv *env;
     jobject owner;
     JSRuntime *runtime = nullptr;
+    quickjs_wrapper::SharedMemoryState *shared_memory = nullptr;
     JSContext *context = nullptr;
     JSValue promise_then = JS_UNDEFINED;
     JSValue error_stack_getter = JS_UNDEFINED;
@@ -83,8 +87,8 @@ struct Runtime {
     std::vector<jclass> classes;
     jclass boolean_class, integer_class, short_class, byte_class, long_class, double_class, number_class;
     jclass string_class, bytes_class, array_class, object_class, bigint_class;
-    jclass json_class, binary_class, text_class, byte_array_class, direct_buffer_class, callback_class, reference_class, transfer_class;
-    jfieldID direct_buffer_data, direct_buffer_detachable;
+    jclass json_class, binary_class, text_class, byte_array_class, direct_buffer_class, shared_buffer_class, callback_class, reference_class, transfer_class;
+    jfieldID direct_buffer_data, direct_buffer_detachable, shared_buffer_data;
     jmethodID dispatch_method, dispatch_async_method, complete_method, rejection_method, normalize_method, load_method, load_bytecode_method;
     jmethodID uncatchable_method;
     JSClassID job_scope_class = 0;
@@ -595,6 +599,13 @@ JSValue from_java(Runtime *rt, jobject value, int depth) {
             JS_FreeValue(ctx, result);
             return java_error(rt);
         }
+        return result;
+    }
+    if (env->IsInstanceOf(value, rt->shared_buffer_class)) {
+        jobject buffer = env->GetObjectField(value, rt->shared_buffer_data);
+        if (env->ExceptionCheck()) return JS_EXCEPTION;
+        JSValue result = quickjs_wrapper::shared_buffer(env, ctx, buffer);
+        env->DeleteLocalRef(buffer);
         return result;
     }
     if (env->IsInstanceOf(value, rt->direct_buffer_class)) {
@@ -1371,6 +1382,7 @@ void destroy(Runtime *rt) {
         JS_FreeContext(rt->context);
     }
     if (rt->runtime) JS_FreeRuntime(rt->runtime);
+    quickjs_wrapper::free_shared_memory_state(rt->shared_memory);
     for (jclass type : rt->classes) delete_global_ref(rt->env, type);
     delete_global_ref(rt->env, rt->owner);
     delete rt;
@@ -1561,7 +1573,8 @@ JSValue reference_operation(Runtime *rt, const std::string &operation,
         if (JS_SetPropertyStr(ctx, result, name, JS_NewInt64(ctx, static_cast<int64_t>(value))) < 0) { \
             JS_FreeValue(ctx, result); return JS_EXCEPTION; \
         }
-        RESOURCE_FIELD("jniGlobalRefs", global_references.load(std::memory_order_relaxed))
+        RESOURCE_FIELD("jniGlobalRefs", global_references.load(std::memory_order_relaxed) + quickjs_wrapper::shared_buffer_roots())
+        RESOURCE_FIELD("sharedAllocations", quickjs_wrapper::shared_buffer_allocations())
         RESOURCE_FIELD("callbacks", rt->callbacks.size())
         RESOURCE_FIELD("callbackOrigins", rt->callback_origins.size())
         RESOURCE_FIELD("references", rt->references.size())
@@ -1658,6 +1671,7 @@ extern "C" JNIEXPORT jlong JNICALL Java_com_fongmi_quickjs_QuickJS_create(JNIEnv
     rt->text_class = cache_class(rt, "com/fongmi/quickjs/QuickJS$Text");
     rt->byte_array_class = cache_class(rt, "com/fongmi/quickjs/QuickJS$ByteArray");
     rt->direct_buffer_class = cache_class(rt, "com/fongmi/quickjs/QuickJS$DirectBuffer");
+    rt->shared_buffer_class = cache_class(rt, "com/fongmi/quickjs/QuickJS$SharedBuffer");
     rt->callback_class = cache_class(rt, "com/fongmi/quickjs/QuickJS$Callback");
     rt->reference_class = cache_class(rt, "com/fongmi/quickjs/QuickJS$Reference");
     rt->transfer_class = cache_class(rt, "com/fongmi/quickjs/QuickJS$Transfer");
@@ -1690,8 +1704,18 @@ extern "C" JNIEXPORT jlong JNICALL Java_com_fongmi_quickjs_QuickJS_create(JNIEnv
     if (!env->ExceptionCheck()) rt->reference_runtime = env->GetFieldID(rt->reference_class, "runtime", "Lcom/fongmi/quickjs/QuickJS;");
     if (!env->ExceptionCheck()) rt->direct_buffer_detachable = env->GetFieldID(rt->direct_buffer_class, "detachable", "Z");
     if (!env->ExceptionCheck()) rt->direct_buffer_data = env->GetFieldID(rt->direct_buffer_class, "buffer", "Ljava/nio/ByteBuffer;");
+    if (!env->ExceptionCheck()) rt->shared_buffer_data = env->GetFieldID(rt->shared_buffer_class, "buffer", "Ljava/nio/ByteBuffer;");
     if (env->ExceptionCheck()) { destroy(rt); return 0; }
     rt->runtime = JS_NewRuntime();
+    if (rt->runtime) {
+        try { rt->shared_memory = quickjs_wrapper::install_shared_memory(rt->runtime); }
+        catch (const std::bad_alloc &) {
+            jclass error = env->FindClass("java/lang/OutOfMemoryError");
+            if (error) { env->ThrowNew(error, "Cannot create shared-memory allocator"); env->DeleteLocalRef(error); }
+            destroy(rt);
+            return 0;
+        }
+    }
     rt->context = rt->runtime ? JS_NewContext(rt->runtime) : nullptr;
     if (!rt->context) {
         jclass error = env->FindClass("java/lang/OutOfMemoryError");
@@ -1788,7 +1812,8 @@ extern "C" JNIEXPORT jlong JNICALL Java_com_fongmi_quickjs_QuickJS_acquireBuffer
     JSValue backing = JS_GetBufferRange(rt->context, rt->references.at(reference_id_value).value, &offset, &length);
     if (JS_IsException(backing)) { throw_script_error(rt); return 0; }
     uint8_t *data = JS_GetArrayBuffer(rt->context, &capacity, backing);
-    if (JS_HasException(rt->context) || JS_IsImmutableArrayBuffer(backing) < 0 ||
+    if (JS_HasException(rt->context) ||
+        (!JS_IsSharedArrayBuffer(backing) && JS_IsImmutableArrayBuffer(backing) < 0) ||
         length > static_cast<size_t>(std::numeric_limits<jint>::max()) || offset > capacity || length > capacity - offset) {
         if (!JS_HasException(rt->context)) JS_ThrowTypeError(rt->context, "Unsupported buffer range");
         JS_FreeValue(rt->context, backing);
@@ -1803,6 +1828,18 @@ extern "C" JNIEXPORT jlong JNICALL Java_com_fongmi_quickjs_QuickJS_acquireBuffer
         JS_ThrowOutOfMemory(rt->context);
         throw_script_error(rt);
         return 0;
+    }
+    if (JS_IsSharedArrayBuffer(backing)) {
+        if (!quickjs_wrapper::retain_shared_buffer(data)) {
+            rt->buffer_leases.erase(id);
+            JS_FreeValue(rt->context, backing);
+            JS_ThrowTypeError(rt->context, "Unknown shared allocation");
+            throw_script_error(rt);
+            return 0;
+        }
+        rt->buffer_leases.at(id) = BufferRange{nullptr, data + offset, length, data};
+        JS_FreeValue(rt->context, backing);
+        return id;
     }
     SharedAllocation *allocation = nullptr;
     if (length) {
@@ -1850,7 +1887,9 @@ extern "C" JNIEXPORT void JNICALL Java_com_fongmi_quickjs_QuickJS_releaseBuffer(
     auto found = rt->buffer_leases.find(id);
     if (found == rt->buffer_leases.end()) return;
     SharedAllocation *allocation = found->second.allocation;
+    void *shared = found->second.shared;
     rt->buffer_leases.erase(found);
+    if (shared) quickjs_wrapper::release_shared_buffer(shared);
     if (allocation && --allocation->pins == 0 && !allocation->js_owner)
         free_allocation(rt->runtime, allocation);
 }

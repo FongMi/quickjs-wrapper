@@ -1,6 +1,7 @@
 package com.fongmi.quickjs;
 
 import com.dylibso.chicory.wasm.InvalidException;
+import com.dylibso.chicory.wasm.types.TypeSection;
 import com.dylibso.chicory.wasm.types.ValType;
 import java.math.BigInteger;
 import java.util.List;
@@ -20,6 +21,8 @@ final class WasmValues {
       case "f32" -> ValType.F32;
       case "f64" -> ValType.F64;
       case "externref" -> ValType.ExternRef;
+      case "gcref" -> ValType.AnyRef;
+      case "exnref" -> ValType.ExnRef;
       case "anyfunc", "funcref" -> ValType.FuncRef;
       default -> throw new InvalidException("Unsupported WASM value type: " + value);
     };
@@ -29,6 +32,18 @@ final class WasmValues {
     for (String value : new String[] {"i32", "i64", "f32", "f64", "externref", "funcref"})
       if (type(value).equals(type)) return value;
     throw new InvalidException("Unsupported WASM value type: " + type);
+  }
+
+  static String name(ValType type, TypeSection types) {
+    if (!type.isReference()) return name(type);
+    int heap = type.typeIdx();
+    if (heap == ValType.ExternRef.typeIdx() || heap == ValType.NoExternRef.typeIdx())
+      return "externref";
+    if (heap == ValType.FuncRef.typeIdx()
+        || heap == ValType.NoFuncRef.typeIdx()
+        || heap >= 0 && types != null && types.getType(heap) != null) return "funcref";
+    if (heap == ValType.ExnRef.typeIdx()) return "exnref";
+    return "gcref";
   }
 
   static String[] names(List<ValType> values) {

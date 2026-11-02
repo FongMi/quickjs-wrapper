@@ -101,6 +101,8 @@ jobs:
         env:
           QUICKJS_HOST_TOOLCHAIN: ${{ matrix.toolchain }}
         run: |
+          ./gradlew.bat --no-daemon jar
+          if ($LASTEXITCODE) { throw 'Java API / JNI header generation failed.' }
           $configure = @('-S', '.', '-B', "$env:RUNNER_TEMP/quickjs-host", '-A', 'x64')
           if ($env:QUICKJS_HOST_TOOLCHAIN -ne 'windows') {
             $configure += @('-T', 'ClangCL', '-DCMAKE_VS_GLOBALS=UseLldLink=true')
@@ -112,6 +114,16 @@ jobs:
           if ($LASTEXITCODE) { throw 'Host JNI configuration failed.' }
           cmake --build "$env:RUNNER_TEMP/quickjs-host" --config Release --target quickjs-wrapper --parallel 4
           if ($LASTEXITCODE) { throw 'Host JNI build failed.' }
+          $readobj = Join-Path $env:ProgramFiles 'LLVM/bin/llvm-readobj.exe'
+          if (!(Test-Path -LiteralPath $readobj)) {
+            $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
+            $readobj = & $vswhere -latest -products '*' -find 'VC/Tools/Llvm/x64/bin/llvm-readobj.exe' | Select-Object -First 1
+          }
+          if (!$readobj -or !(Test-Path -LiteralPath $readobj)) { throw 'LLVM export inspection tool is missing.' }
+          $symbols = & $readobj --coff-exports "$env:RUNNER_TEMP/quickjs-host/Release/quickjs-wrapper.dll"
+          if ($LASTEXITCODE) { throw 'Host JNI export inspection failed.' }
+          ./scripts/verify-jni.ps1 -JavaJar build/libs/wrapper-java-0.1.0-SNAPSHOT.jar -Symbols $symbols
+          ./scripts/verify-shared-memory.ps1 -NativeDirectory "$env:RUNNER_TEMP/quickjs-host/Release"
           New-Item -ItemType Directory artifacts | Out-Null
           Copy-Item "$env:RUNNER_TEMP/quickjs-host/Release/quickjs-wrapper.dll" artifacts/
           [ordered]@{

@@ -1,5 +1,11 @@
 (({host, connect, begin, detach, load, moduleLimits}) => {
-    const modules = new WeakMap(), instances = new WeakMap(), memories = new WeakMap(), tables = new WeakMap(), globals = new WeakMap(), functions = new WeakMap();
+    const modules = new WeakMap(), instances = new WeakMap(), memories = new WeakMap(), tables = new WeakMap(), globals = new WeakMap(), tags = new WeakMap(), functions = new WeakMap();
+    const gcValues = new WeakMap(), gcObjects = new Map();
+    function immutableGcObject() { throw new TypeError('WASM GC objects cannot be modified'); }
+    const gcOperations = Object.freeze(Object.assign(Object.create(null), {
+        set: immutableGcObject, deleteProperty: immutableGcObject,
+        defineProperty: () => false, setPrototypeOf: () => false, preventExtensions: () => false
+    }));
     const nativeObjects = new Map(), states = new Map(), bufferOwners = new WeakMap();
     const frames = [], cells = new Map(), objectCells = new WeakMap();
     const cellCleanup = new FinalizationRegistry(id => cells.delete(id));
@@ -24,11 +30,44 @@
         return WasmError;
     }
     const CompileError = errorType('CompileError'), LinkError = errorType('LinkError'), RuntimeError = errorType('RuntimeError');
-    const errors = {CompileError, LinkError, RuntimeError, RangeError};
+    const errors = {CompileError, LinkError, RuntimeError, RangeError, TypeError};
     const cleanup = new FinalizationRegistry(id => { nativeObjects.delete(id); states.delete(id); host('release', id); });
+    const gcCleanup = new FinalizationRegistry(({address, id}) => {
+        if (gcObjects.get(address)?.id === id) gcObjects.delete(address);
+        host('release', id);
+    });
+    function gcRoots(instance, address) {
+        const [external, funcs] = run('gcRoots', instance, address);
+        return [...external.map(rootReference), ...funcs.map(tableFunction)];
+    }
+    function gcValue([kind, value]) {
+        if (kind === 'extern') return cellValue(value);
+        if (kind === 'i31') return value;
+        const previous = gcObjects.get(value)?.ref.deref();
+        if (previous) return previous;
+        const id = run('gcHandle', value), object = new Proxy(Object.preventExtensions(Object.create(null)), gcOperations);
+        const state = {id, address: value, roots: gcRoots(false, value)};
+        gcValues.set(object, state);
+        gcObjects.set(value, {id, ref: new WeakRef(object)});
+        gcCleanup.register(object, {address: value, id});
+        return object;
+    }
+    function gcRoot(value) { return value[0] === 'extern' ? rootReference(value[1]) : gcValue(value); }
+    function encodedRoot(type, value, encoded) {
+        return type === 'externref' || type === 'gcref' && encoded[0] === 0 ? rootReference(encoded[1]) : value;
+    }
+    function gcEncode(value) {
+        const state = gcValues.get(value);
+        if (state) { retain(value); return [1, state.id]; }
+        if (typeof value === 'number' && Number.isInteger(value) && value >= -0x40000000 && value < 0x40000000)
+            return [2, value];
+        return [0, ref(value)];
+    }
+    function externalValue(value) { return Array.isArray(value) ? gcValue(value) : cellValue(value); }
+    function externalRoot(value) { return Array.isArray(value) ? gcValue(value) : rootReference(value); }
     function run(op, ...args) {
         const [error, value] = host(op, ...args);
-        if (error === 'host') throw frames[frames.length - 1].failure;
+        if (error === 'exception') throw exceptionValue(value);
         if (error) throw new errors[error](value);
         return value;
     }
@@ -75,7 +114,7 @@
         const maximum = upper === undefined ? max : index(upper);
         if (initial > max || maximum > max) throw new RangeError('WASM size exceeds supported maximum');
         if (initial > maximum) throw new RangeError('WASM initial exceeds maximum');
-        return [initial, maximum];
+        return [initial, maximum, upper !== undefined];
     }
     function valueType(value, reference = false) {
         const type = String(value);
@@ -103,14 +142,17 @@
     }
     function cellValue(id) { const cell = rootReference(id); return cell === null ? null : cell.value; }
     function encode(type, value) {
+        if (type === 'exnref') throw new TypeError('WASM exception references cannot be passed from JavaScript');
         if (type === 'externref') return ref(value);
+        if (type === 'gcref') return gcEncode(value);
+        if (type === 'funcref') return functionRef(value);
         if (type === 'i64') {
             return BigInt.asIntN(64, value);
         }
         const number = +value;
         return type === 'i32' ? number | 0 : type === 'f32' ? Math.fround(number) : number;
     }
-    function decode(type, value) { return type === 'externref' ? cellValue(value) : value; }
+    function decode(type, value) { if (type === 'exnref') throw new TypeError('WASM exception references cannot be returned to JavaScript'); return type === 'externref' ? externalValue(value) : type === 'funcref' ? tableFunction(value) : type === 'gcref' ? gcValue(value) : value; }
     function retain(value, frame = frames[frames.length - 1]) {
         if (frame) frame.roots.push(value);
     }
@@ -118,7 +160,7 @@
         const slots = new Map();
         for (const object of state.resources) {
             const table = tables.get(object), global = globals.get(object);
-            if (table || global?.type === 'externref') slots.set((table || global).id, {table, global});
+            if (table && table.type !== 'exnref' || global?.type === 'externref' || global?.type === 'funcref' || global?.type === 'gcref') slots.set((table || global).id, {table, global});
         }
         return slots;
     }
@@ -131,7 +173,7 @@
         const requests = [...slots].map(([id, {table}]) => [id, table?.revision ?? -1n]);
         const updates = run('references', requests).map(([id, revision, value]) => {
             const slot = slots.get(id);
-            const roots = slot.table ? value.map(ref => slot.table.type === 'externref' ? rootReference(ref[1]) : tableFunction(ref)) : rootReference(value);
+            const roots = slot.table ? value.map(ref => slot.table.type === 'externref' ? externalRoot(ref[1]) : slot.table.type === 'gcref' ? gcRoot(ref) : tableFunction(ref)) : slot.global.type === 'funcref' ? tableFunction(value) : slot.global.type === 'gcref' ? gcRoot(value) : externalRoot(value);
             return {slot, revision, roots};
         });
         for (const {slot, revision, roots} of updates) {
@@ -145,9 +187,18 @@
         const slots = new Map();
         for (const state of frame.states) {
             loadResources(state, run('resources', state.id));
+            retain(state.gcRoots, frame);
+            state.gcRoots = gcRoots(true, state.id);
             for (const [id, slot] of referenceSlots(state)) slots.set(id, slot);
         }
         refreshSlots(slots, frame);
+        for (const {ref} of gcObjects.values()) {
+            const object = ref.deref();
+            if (!object) continue;
+            const state = gcValues.get(object);
+            retain(state.roots, frame);
+            state.roots = gcRoots(false, state.address);
+        }
     }
     function discard(frame) {
         const index = frames.indexOf(frame);
@@ -186,7 +237,8 @@
     function functionRef(value) {
         if (value === null) return [0, -1];
         const fn = functions.get(value);
-        if (!fn) throw new TypeError('WASM table requires an exported WASM function');
+        if (!fn) throw new TypeError('WASM reference requires an exported WASM function');
+        retain(value);
         return [fn.state.id, fn.index];
     }
     function makeFunction(state, descriptor) {
@@ -195,6 +247,7 @@
         if (!state) throw new RuntimeError('WASM function instance is no longer available');
         if (state.functions.has(index)) return state.functions.get(index);
         const fn = (...args) => invoke(state, execution => {
+            if (params.includes('exnref') || results.includes('exnref')) throw new TypeError('WASM exception references cannot cross the JavaScript function boundary');
             const values = run('call', execution, state.id, index, params.map((type, i) => encode(type, args[i])));
             const decoded = results.map((type, i) => decode(type, values[i]));
             return decoded.length > 1 ? decoded : decoded[0];
@@ -208,11 +261,65 @@
         const [kind, id, type, mutable] = descriptor;
         const previous = nativeObjects.get(id)?.deref();
         if (previous) return previous;
-        const constructor = kind === 'memory' ? Memory : kind === 'table' ? Table : Global;
+        const constructor = kind === 'memory' ? Memory : kind === 'table' ? Table : kind === 'tag' ? Tag : Global;
         const object = Object.create(constructor.prototype);
-        own(object, id, kind === 'memory' ? memories : kind === 'table' ? tables : globals, {type, mutable, roots: []});
+        own(object, id, kind === 'memory' ? memories : kind === 'table' ? tables : kind === 'tag' ? tags : globals, {type, mutable, nullable: kind === 'table' ? mutable : undefined, shared: kind === 'memory' ? type : false, roots: []});
         return object;
     }
+    class Tag {
+        constructor(descriptor) {
+            const parameters = [...descriptor.parameters].map(type => valueType(type, true));
+            const [, id] = run('tag', parameters);
+            own(this, id, tags, {type: parameters});
+        }
+    }
+    function initializeException(object, address, tag, values) {
+        const id = run('gcHandle', address);
+        const state = {id, address, exception: true, tag, values, roots: gcRoots(false, address)};
+        gcValues.set(object, state);
+        gcObjects.set(address, {id, ref: new WeakRef(object)});
+        gcCleanup.register(object, {address, id});
+        return object;
+    }
+    function exceptionValue(address) {
+        const previous = gcObjects.get(address)?.ref.deref();
+        if (previous) return previous;
+        const [descriptor, values] = run('exceptionInfo', address), tag = resource(descriptor);
+        if (tag === JSTag) return decode('externref', values[0]);
+        return initializeException(Object.create(Exception.prototype), address, tag, values);
+    }
+    class Exception {
+        constructor(tag, payload, options = {}) {
+            const info = slot(tags, tag), values = [...payload];
+            if (tag === JSTag) throw new TypeError('JSTag cannot construct a WebAssembly.Exception');
+            if (values.length !== info.type.length) throw new TypeError('Invalid WASM exception payload count');
+            const encoded = info.type.map((type, i) => encode(type, values[i]));
+            const address = run('exception', info.id, encoded);
+            const [, payloadValues] = run('exceptionInfo', address);
+            initializeException(this, address, tag, payloadValues);
+            if (options?.traceStack) gcValues.get(this).stack = new Error().stack;
+        }
+        is(tag) {
+            const state = slot(gcValues, this);
+            slot(tags, tag);
+            if (!state.exception) throw new TypeError('Invalid WebAssembly.Exception receiver');
+            return state.tag === tag;
+        }
+        getArg(tag, position) {
+            const state = slot(gcValues, this);
+            slot(tags, tag);
+            if (!state.exception || state.tag !== tag) throw new TypeError('WASM exception tag does not match');
+            const offset = index(position), types = slot(tags, tag).type;
+            if (offset >= types.length) throw new RangeError('WASM exception argument is out of bounds');
+            return decode(types[offset], state.values[offset]);
+        }
+        get stack() {
+            const state = slot(gcValues, this);
+            if (!state.exception) throw new TypeError('Invalid WebAssembly.Exception receiver');
+            return state.stack;
+        }
+    }
+    const JSTag = new Tag({parameters: ['externref']});
     class Module {
         constructor(binary) {
             const [id, imports, exports] = run('compile', bytes(binary));
@@ -228,15 +335,17 @@
     }
     class Memory {
         constructor(descriptor) {
-            const [initial, maximum] = limits(descriptor, 65536);
-            if (descriptor.shared) throw new TypeError('Shared WASM memory is disabled');
-            const [, id] = run('memory', initial, maximum);
-            own(this, id, memories);
+            const [initial, maximum, hasMaximum] = limits(descriptor, 65536);
+            const shared = !!descriptor.shared;
+            if (shared && !hasMaximum) throw new TypeError('Shared WASM memory requires a maximum');
+            const [, id] = run('memory', initial, maximum, shared);
+            own(this, id, memories, {shared});
         }
         get buffer() {
             const state = slot(memories, this);
-            if (!state.buffer) {
+            if (!state.buffer || state.shared && sharedLength.call(state.buffer) !== run('size', state.id)) {
                 state.buffer = run('buffer', state.id);
+                if (state.shared) Object.freeze(state.buffer);
                 bufferOwners.set(state.buffer, this);
             }
             return state.buffer;
@@ -257,43 +366,53 @@
             const encoded = type === 'externref' ? [0, ref(value)] : functionRef(value);
             const [, id] = run('table', type, initial, maximum, encoded);
             const root = type === 'externref' ? rootReference(encoded[1]) : value;
-            own(this, id, tables, {type, roots: Array(initial).fill(root)});
+            own(this, id, tables, {type, nullable: true, roots: Array(initial).fill(root)});
         }
         get length() { return run('tableSize', slot(tables, this).id); }
         get(position) {
             const state = slot(tables, this), i = index(position);
+            if (state.type === 'exnref') throw new TypeError('WASM exception references cannot cross the JavaScript table boundary');
             if (i >= run('tableSize', state.id)) throw new RangeError('WASM table index out of bounds');
             const value = run('tableGet', state.id, i);
-            return state.type === 'externref' ? cellValue(value[1]) : tableFunction(value);
+            return state.type === 'externref' ? externalValue(value[1]) : state.type === 'gcref' ? gcValue(value) : tableFunction(value);
         }
         set(position, value) {
             const state = slot(tables, this), i = index(position);
+            if (state.type === 'gcref' && arguments.length < 2) {
+                if (!state.nullable) throw new TypeError('Non-nullable WASM tables require a value');
+                value = null;
+            }
+            if (state.type === 'exnref') throw new TypeError('WASM exception references cannot cross the JavaScript table boundary');
             if (state.type === 'funcref' && value === undefined) value = null;
             if (i >= run('tableSize', state.id)) throw new RangeError('WASM table index out of bounds');
-            const encoded = state.type === 'externref' ? [0, ref(value)] : functionRef(value);
+            const encoded = state.type === 'externref' ? [0, ref(value)] : state.type === 'gcref' ? gcEncode(value) : functionRef(value);
             retain(state.roots[i]);
             run('tableSet', state.id, i, encoded);
-            state.roots[i] = state.type === 'externref' ? rootReference(encoded[1]) : value;
+            state.roots[i] = encodedRoot(state.type, value, encoded);
         }
         grow(delta, value) {
-            const state = slot(tables, this);
+            const state = slot(tables, this), count = index(delta);
+            if (state.type === 'gcref' && arguments.length < 2) {
+                if (!state.nullable) throw new TypeError('Non-nullable WASM tables require a value');
+                value = null;
+            }
+            if (state.type === 'exnref') throw new TypeError('WASM exception references cannot cross the JavaScript table boundary');
             if (state.type === 'funcref' && value === undefined) value = null;
-            const count = index(delta);
-            const encoded = state.type === 'externref' ? [0, ref(value)] : functionRef(value);
+            const encoded = state.type === 'externref' ? [0, ref(value)] : state.type === 'gcref' ? gcEncode(value) : functionRef(value);
             const result = run('growTable', state.id, count, encoded);
             if (result < 0) throw new RangeError('WASM table cannot grow');
             state.roots.length = run('tableSize', state.id);
-            state.roots.fill(state.type === 'externref' ? rootReference(encoded[1]) : value, result);
+            state.roots.fill(encodedRoot(state.type, value, encoded), result);
             return result;
         }
     }
     class Global {
         constructor(descriptor, value) {
-            const mutable = !!descriptor.mutable, type = valueType(descriptor.value);
-            if (value === undefined) value = type === 'i64' ? 0n : type === 'externref' ? undefined : 0;
+            const mutable = !!descriptor.mutable, type = valueType(descriptor.value, true);
+            if (value === undefined) value = type === 'i64' ? 0n : type === 'externref' ? undefined : type === 'funcref' ? null : 0;
             const encoded = encode(type, value);
             const [, id] = run('global', type, mutable, encoded);
-            own(this, id, globals, {type, mutable, root: type === 'externref' ? rootReference(encoded) : null});
+            own(this, id, globals, {type, mutable, root: type === 'externref' ? rootReference(encoded) : type === 'funcref' ? value : null});
         }
         get value() { const state = slot(globals, this); return decode(state.type, run('globalGet', state.id)); }
         set value(value) {
@@ -303,6 +422,7 @@
             retain(state.root);
             run('globalSet', state.id, encoded);
             if (state.type === 'externref') state.root = rootReference(encoded);
+            else if (state.type === 'funcref' || state.type === 'gcref') state.root = encodedRoot(state.type, value, encoded);
         }
         valueOf() { const state = slot(globals, this); return decode(state.type, run('globalGet', state.id)); }
     }
@@ -319,10 +439,13 @@
                 const fn = functions.get(value);
                 link = fn ? [fn.state.id, fn.index] : [];
             } else {
-                const map = kind === 'memory' ? memories : kind === 'table' ? tables : globals;
+                const map = kind === 'memory' ? memories : kind === 'table' ? tables : kind === 'tag' ? tags : globals;
                 if (kind === 'global' && !mutable && !map.has(value)) {
-                    if (type !== 'externref' && typeof value !== (type === 'i64' ? 'bigint' : 'number')) throw new LinkError('Invalid WASM global import: ' + namespace + '.' + name);
-                    value = new Global({value: type}, value);
+                    if (type !== 'externref' && type !== 'funcref' && type !== 'gcref' && typeof value !== (type === 'i64' ? 'bigint' : 'number')) throw new LinkError('Invalid WASM global import: ' + namespace + '.' + name);
+                    const encoded = encode(type, value);
+                    const object = resource(run('globalImport', state.id, i, encoded));
+                    globals.get(object).root = type === 'externref' ? rootReference(encoded) : type === 'gcref' ? encodedRoot(type, value, encoded) : value;
+                    value = object;
                 }
                 const imported = map.get(value);
                 if (!imported) throw new LinkError('Invalid WASM ' + kind + ' import: ' + namespace + '.' + name);
@@ -378,6 +501,7 @@
         get exports() { return slot(instances, this).exports; }
     }
     connect((operation, id, index, values) => {
+        if (operation === 'internalize') return gcEncode(cellValue(id));
         if (operation === 'enter') {
             const state = states.get(index)?.deref();
             if (!state) throw new RuntimeError('WASM instance is no longer available');
@@ -397,7 +521,7 @@
             if (object) {
                 const state = memories.get(object);
                 if (state.buffer) {
-                    detach({buffer: state.buffer});
+                    if (!state.shared) detach({buffer: state.buffer});
                     bufferOwners.delete(state.buffer);
                     state.buffer = undefined;
                 }
@@ -415,8 +539,13 @@
             if (state.legacy && value && typeof value.then === 'function') throw new TypeError('WASM imports must be synchronous');
             const returned = results.length === 0 ? [] : results.length === 1 ? [value] : [...value];
             if (returned.length !== results.length) throw new TypeError('Invalid WASM result count');
-            return results.map((type, i) => encode(type, returned[i]));
-        } catch (reason) { frames[frames.length - 1].failure = reason; return null; }
+            return [0, results.map((type, i) => encode(type, returned[i]))];
+        } catch (reason) {
+            const exception = gcValues.get(reason);
+            if (exception?.exception) { retain(reason); return [1, exception.address]; }
+            const address = run('exception', slot(tags, JSTag).id, [ref(reason)]);
+            return [1, address];
+        }
     });
     function responseAccess() {
         const constructor = globalThis.Response;
@@ -529,7 +658,7 @@
             return result;
         } finally { release(); finish(); }
     }
-    const webAssembly = {Module, Instance, Memory, Table, Global, CompileError, LinkError, RuntimeError,
+    const webAssembly = {Module, Instance, Memory, Table, Global, Tag, Exception, CompileError, LinkError, RuntimeError,
         validate(binary) {
             let module;
             try { module = new Module(binary); return true; }
@@ -549,11 +678,12 @@
             return {module, instance: new Instance(module, imports)};
         }
     };
+    Object.defineProperty(webAssembly, 'JSTag', {value: JSTag, enumerable: true});
     for (const value of [Instance, Table, Global, Table.prototype.grow, Table.prototype.set, webAssembly.instantiate, webAssembly.instantiateStreaming]) Object.defineProperty(value, 'length', {value: 1, configurable: true});
-    for (const [name, value] of Object.entries({Module, Instance, Memory, Table, Global})) Object.defineProperty(value.prototype, Symbol.toStringTag, {value: 'WebAssembly.' + name, configurable: true});
+    for (const [name, value] of Object.entries({Module, Instance, Memory, Table, Global, Tag, Exception})) Object.defineProperty(value.prototype, Symbol.toStringTag, {value: 'WebAssembly.' + name, configurable: true});
     Object.defineProperty(webAssembly, Symbol.toStringTag, {value: 'WebAssembly', configurable: true});
-    for (const key of ['Module', 'Instance', 'Memory', 'Table', 'Global', 'CompileError', 'LinkError', 'RuntimeError']) Object.defineProperty(webAssembly, key, {enumerable: false});
-    for (const constructor of [Module, Instance, Memory, Table, Global]) for (const key of Object.getOwnPropertyNames(constructor.prototype)) {
+    for (const key of ['Module', 'Instance', 'Memory', 'Table', 'Global', 'Tag', 'Exception', 'CompileError', 'LinkError', 'RuntimeError']) Object.defineProperty(webAssembly, key, {enumerable: false});
+    for (const constructor of [Module, Instance, Memory, Table, Global, Tag, Exception]) for (const key of Object.getOwnPropertyNames(constructor.prototype)) {
         if (key !== 'constructor') Object.defineProperty(constructor.prototype, key, {enumerable: true});
     }
     for (const key of ['imports', 'exports', 'customSections']) Object.defineProperty(Module, key, {enumerable: true});
@@ -606,5 +736,5 @@
         }
         return memories.get(object).id;
     }
-    return Object.freeze({instantiate});
+    return Object.freeze({instantiate, memory: resource});
 })

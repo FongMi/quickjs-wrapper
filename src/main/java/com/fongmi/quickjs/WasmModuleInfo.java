@@ -1,12 +1,10 @@
 package com.fongmi.quickjs;
 
 import static com.fongmi.quickjs.WasmValues.name;
-import static com.fongmi.quickjs.WasmValues.names;
 
 import com.dylibso.chicory.wasm.InvalidException;
 import com.dylibso.chicory.wasm.Parser;
 import com.dylibso.chicory.wasm.WasmModule;
-import com.dylibso.chicory.wasm.types.ExternalType;
 import com.dylibso.chicory.wasm.types.FunctionBody;
 import com.dylibso.chicory.wasm.types.FunctionImport;
 import com.dylibso.chicory.wasm.types.FunctionType;
@@ -54,65 +52,49 @@ final class WasmModuleInfo {
 
   private void validateImports() {
     for (var value : module.importSection().stream().toList()) {
-      if (value instanceof MemoryImport memory && memory.limits().shared())
-        throw new InvalidException("Shared WASM memory is disabled");
-      else if (value instanceof GlobalImport global) validateFunctionType(global.type());
-      else if (value instanceof TableImport table) name(table.entryType());
-      else if (value.importType() == ExternalType.TAG)
-        throw new InvalidException("WASM exception tags are not supported");
+      if (value instanceof GlobalImport global) validateFunctionType(global.type());
+      else if (value instanceof TableImport table) valueName(table.entryType());
     }
   }
 
   private void validateTypes() {
     for (int i = 0; i < module.typeSection().subTypeCount(); i++) {
+      var composite = module.typeSection().getSubType(i).compType();
+      if (composite.structType() != null)
+        for (var field : composite.structType().fieldTypes()) {
+          ValType value = field.storageType().valType();
+          if (value != null) validateFunctionType(value);
+        }
+      if (composite.arrayType() != null) {
+        ValType value = composite.arrayType().fieldType().storageType().valType();
+        if (value != null) validateFunctionType(value);
+      }
       FunctionType type = module.typeSection().getType(i);
-      if (type == null) throw new InvalidException("WASM GC types are not supported");
+      if (type == null) continue;
       for (ValType value : type.params()) validateFunctionType(value);
       for (ValType value : type.returns()) validateFunctionType(value);
     }
   }
 
   private void validateResources() {
-    int memories =
-        module.memorySection().map(MemorySection::memoryCount).orElse(0)
-            + (int) module.importSection().stream().filter(MemoryImport.class::isInstance).count();
-    if (memories > 1) throw new InvalidException("Multiple WASM memories are not supported");
     for (int i = 0; i < module.tableSection().tableCount(); i++)
-      name(module.tableSection().getTable(i).elementType());
-    if (module.tagSection().isPresent())
-      throw new InvalidException("WASM exception tags are not supported");
+      valueName(module.tableSection().getTable(i).elementType());
     for (int i = 0; i < module.globalSection().globalCount(); i++)
       validateFunctionType(module.globalSection().getGlobal(i).valueType());
-    for (int i = 0; i < module.memorySection().map(MemorySection::memoryCount).orElse(0); i++)
-      if (module.memorySection().get().getMemory(i).limits().shared())
-        throw new InvalidException("Shared WASM memory is disabled");
   }
 
   private void validateInstructions(Runnable check) {
     int instructions = 0;
     int function = functions.size();
     for (FunctionBody body : module.codeSection().functionBodies()) {
-      for (ValType value : body.localTypes()) name(value);
+      for (ValType value : body.localTypes()) valueName(value);
       for (var instruction : body.instructions()) {
         if ((instructions++ & 1023) == 0) check.run();
         OpCode opcode = instruction.opcode();
         int prefix = opcode.opcode() >>> 8;
-        if (prefix == 0xfb
-            || prefix == 0xfd
-            || prefix == 0xfe
-            || opcode == OpCode.CALL_REF
-            || opcode == OpCode.RETURN_CALL
-            || opcode == OpCode.RETURN_CALL_REF
-            || opcode == OpCode.RETURN_CALL_INDIRECT)
+        if (prefix == 0xfd)
           throw unsupportedInstruction(
               "Unsupported WASM instruction", opcode, function, instruction.address());
-        if ((opcode == OpCode.TABLE_GET || opcode == OpCode.TABLE_SET)
-            && tableType((int) instruction.operand(0)).equals(ValType.FuncRef))
-          throw unsupportedInstruction(
-              "First-class WASM function references are not supported",
-              opcode,
-              function,
-              instruction.address());
       }
       function++;
     }
@@ -144,6 +126,11 @@ final class WasmModuleInfo {
     return new WasmModuleInfo(this);
   }
 
+  int memoryCount() {
+    return module.memorySection().map(MemorySection::memoryCount).orElse(0)
+        + (int) module.importSection().stream().filter(MemoryImport.class::isInstance).count();
+  }
+
   ByteBuffer binaryKey() {
     return ByteBuffer.wrap(binary).asReadOnlyBuffer();
   }
@@ -167,19 +154,8 @@ final class WasmModuleInfo {
     return result.toArray();
   }
 
-  private ValType tableType(int index) {
-    for (var value : module.importSection().stream().toList())
-      if (value instanceof TableImport table) {
-        if (index-- == 0) return table.entryType();
-      }
-    return module.tableSection().getTable(index).elementType();
-  }
-
-  private static void validateFunctionType(ValType value) {
-    name(value);
-    if (value.equals(ValType.FuncRef))
-      throw new InvalidException(
-          "WASM function reference parameters and results are not supported");
+  private void validateFunctionType(ValType value) {
+    valueName(value);
   }
 
   FunctionType functionType(int index) {
@@ -188,6 +164,14 @@ final class WasmModuleInfo {
             ? functions.get(index).typeIndex()
             : module.functionSection().getFunctionType(index - functions.size());
     return module.typeSection().getType(type);
+  }
+
+  String valueName(ValType value) {
+    return WasmValues.name(value, module.typeSection());
+  }
+
+  String[] valueNames(List<ValType> values) {
+    return values.stream().map(this::valueName).toArray(String[]::new);
   }
 
   Object[] imports() {
@@ -200,8 +184,8 @@ final class WasmModuleInfo {
                   value.module(),
                   value.name(),
                   "function",
-                  names(type.params()),
-                  names(type.returns())
+                  valueNames(type.params()),
+                  valueNames(type.returns())
                 };
               }
               if (value instanceof GlobalImport global)
@@ -209,7 +193,7 @@ final class WasmModuleInfo {
                   value.module(),
                   value.name(),
                   "global",
-                  name(global.type()),
+                  valueName(global.type()),
                   global.mutabilityType() == MutabilityType.Var
                 };
               return new Object[] {

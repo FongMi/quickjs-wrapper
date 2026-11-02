@@ -1,21 +1,29 @@
 package com.fongmi.quickjs;
 
+import com.dylibso.chicory.runtime.FunctionReferenceStore;
 import com.dylibso.chicory.runtime.ImportValue;
 import com.dylibso.chicory.runtime.Instance;
 import com.dylibso.chicory.runtime.InterpreterMachine;
 import com.dylibso.chicory.runtime.TableInstance;
-import com.dylibso.chicory.wasm.InvalidException;
+import com.dylibso.chicory.runtime.internal.GcRefStore;
 import com.dylibso.chicory.wasm.types.MemoryLimits;
 import com.dylibso.chicory.wasm.types.Table;
 import java.lang.ref.PhantomReference;
 import java.lang.ref.ReferenceQueue;
 import java.nio.ByteBuffer;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Deque;
 import java.util.HashMap;
 import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.function.Consumer;
+import java.util.function.LongFunction;
+import java.util.function.LongUnaryOperator;
 
 final class WasmStore implements WasmMemory.Allocator {
 
@@ -36,6 +44,10 @@ final class WasmStore implements WasmMemory.Allocator {
   private final Map<PhantomReference<TableInstance>, Integer> tableAllocations = new HashMap<>();
   private final Runnable interruptionCheck;
   private final Consumer<WasmMemory> memoryChanged;
+  private final Deque<InvocationScope> calls = new ArrayDeque<>();
+  final FunctionReferenceStore functions = new FunctionReferenceStore();
+  final GcRefStore heap;
+  private final LongUnaryOperator internalize;
   private int nextId;
   private int moduleBytes;
   private int memoryBytes;
@@ -43,8 +55,25 @@ final class WasmStore implements WasmMemory.Allocator {
   private int cachedBytes;
 
   WasmStore(Runnable interruptionCheck, Consumer<WasmMemory> memoryChanged) {
+    this(interruptionCheck, memoryChanged, value -> value, value -> null);
+  }
+
+  WasmStore(
+      Runnable interruptionCheck,
+      Consumer<WasmMemory> memoryChanged,
+      LongUnaryOperator internalize,
+      LongFunction<Object> externalRoot) {
     this.interruptionCheck = interruptionCheck;
     this.memoryChanged = memoryChanged;
+    this.internalize = internalize;
+    heap =
+        new GcRefStore(
+            bytes -> {
+              if (bytes > 64L * 1024 * 1024)
+                throw new WasmLimitException("WASM GC heap budget exhausted");
+            },
+            externalRoot,
+            value -> functions.get((int) value));
   }
 
   WasmModuleInfo compile(byte[] bytes) {
@@ -73,7 +102,13 @@ final class WasmStore implements WasmMemory.Allocator {
   }
 
   WasmMemory memory(MemoryLimits limits) {
-    return new WasmMemory(limits, this);
+    if (!limits.shared()) return new WasmMemory(limits, this);
+    SharedMemory.requireNative();
+    return memory(new SharedMemory(limits, allocate(SharedMemory.capacity(limits))));
+  }
+
+  WasmMemory memory(SharedMemory memory) {
+    return new WasmSharedMemory(memory, this);
   }
 
   Instance instantiate(
@@ -82,30 +117,85 @@ final class WasmStore implements WasmMemory.Allocator {
       Consumer<Instance> enter,
       Consumer<Instance> leave,
       Runnable poll) {
+    Invocation invocation = new Invocation(enter, leave);
     return Instance.builder(module.module)
+        .withFunctionReferenceStore(functions)
+        .withGcRefStore(heap)
+        .withReferenceInternalizer(internalize)
         .withMachineFactory(
             owner -> {
+              invocation.owner = owner;
               InterpreterMachine machine = new InterpreterMachine(owner);
               return (index, arguments) -> {
-                enter.accept(owner);
-                try {
+                try (InvocationScope scope = new InvocationScope()) {
+                  invocation.enter();
                   return machine.call(index, arguments);
-                } finally {
-                  leave.accept(owner);
                 }
               };
             })
         .withImportValuesByIndex(imports)
-        .withMemoryFactory(
-            limits -> {
-              if (limits.shared()) throw new InvalidException("Shared WASM memory is disabled");
-              return memory(limits);
-            })
+        .withMemoryFactory(this::memory)
         .withTableFactory(this::table)
-        .withUnsafeExecutionListener((instruction, stack) -> poll.run())
+        .withUnsafeExecutionListener(
+            (instruction, stack) -> {
+              invocation.enter();
+              poll.run();
+            })
         .withInitialize(false)
         .withStart(false)
         .build();
+  }
+
+  private final class Invocation {
+
+    final Consumer<Instance> enter;
+    final Consumer<Instance> leave;
+    Instance owner;
+
+    Invocation(Consumer<Instance> enter, Consumer<Instance> leave) {
+      this.enter = enter;
+      this.leave = leave;
+    }
+
+    void enter() {
+      InvocationScope scope = calls.element();
+      if (!scope.entered.add(this)) return;
+      try {
+        enter.accept(owner);
+      } catch (RuntimeException | Error error) {
+        scope.entered.remove(this);
+        throw error;
+      }
+    }
+  }
+
+  private final class InvocationScope implements AutoCloseable {
+
+    final Set<Invocation> entered = new LinkedHashSet<>();
+
+    InvocationScope() {
+      heap.enter();
+      calls.push(this);
+    }
+
+    @Override
+    public void close() {
+      calls.pop();
+      heap.leave();
+      List<Invocation> values = new ArrayList<>(entered);
+      Throwable failure = null;
+      for (int i = values.size() - 1; i >= 0; i--) {
+        Invocation value = values.get(i);
+        try {
+          value.leave.accept(value.owner);
+        } catch (RuntimeException | Error error) {
+          if (failure == null) failure = error;
+          else failure.addSuppressed(error);
+        }
+      }
+      if (failure instanceof RuntimeException error) throw error;
+      if (failure instanceof Error error) throw error;
+    }
   }
 
   Integer id(Object object) {
@@ -140,6 +230,10 @@ final class WasmStore implements WasmMemory.Allocator {
     identities.remove(value);
     if (value instanceof WasmModuleInfo module) moduleBytes -= module.bytes;
     return value;
+  }
+
+  void collectHeap() {
+    heap.collect(new long[0]);
   }
 
   @Override
@@ -193,6 +287,7 @@ final class WasmStore implements WasmMemory.Allocator {
 
     TrackedTable(Table table, int initial, Instance owner) {
       super(table, initial, owner);
+      bindReferences(heap);
       allocation = new PhantomReference<>(this, tableQueue);
       tableAllocations.put(allocation, size());
       tableElements += size();
@@ -230,6 +325,8 @@ final class WasmStore implements WasmMemory.Allocator {
   }
 
   void clear() {
+    heap.clear();
+    functions.clear();
     compiled.clear();
     handles.clear();
     identities.clear();
