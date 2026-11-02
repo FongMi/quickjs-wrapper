@@ -3,7 +3,6 @@ package com.fongmi.quickjs;
 import static com.fongmi.quickjs.WasmValues.fromWasm;
 import static com.fongmi.quickjs.WasmValues.integer;
 import static com.fongmi.quickjs.WasmValues.name;
-import static com.fongmi.quickjs.WasmValues.names;
 import static com.fongmi.quickjs.WasmValues.toWasm;
 import static com.fongmi.quickjs.WasmValues.type;
 
@@ -12,11 +11,16 @@ import com.dylibso.chicory.runtime.ImportFunction;
 import com.dylibso.chicory.runtime.ImportGlobal;
 import com.dylibso.chicory.runtime.ImportMemory;
 import com.dylibso.chicory.runtime.ImportTable;
+import com.dylibso.chicory.runtime.ImportTag;
 import com.dylibso.chicory.runtime.ImportValue;
 import com.dylibso.chicory.runtime.Instance;
 import com.dylibso.chicory.runtime.Memory;
 import com.dylibso.chicory.runtime.TableInstance;
+import com.dylibso.chicory.runtime.TagInstance;
+import com.dylibso.chicory.runtime.WasmException;
+import com.dylibso.chicory.runtime.WasmI31Ref;
 import com.dylibso.chicory.runtime.WasmRuntimeException;
+import com.dylibso.chicory.runtime.internal.GcRefStore;
 import com.dylibso.chicory.wasm.ChicoryException;
 import com.dylibso.chicory.wasm.InvalidException;
 import com.dylibso.chicory.wasm.UninstantiableException;
@@ -31,7 +35,10 @@ import com.dylibso.chicory.wasm.types.MutabilityType;
 import com.dylibso.chicory.wasm.types.Table;
 import com.dylibso.chicory.wasm.types.TableImport;
 import com.dylibso.chicory.wasm.types.TableLimits;
+import com.dylibso.chicory.wasm.types.TagImport;
+import com.dylibso.chicory.wasm.types.TypeSection;
 import com.dylibso.chicory.wasm.types.ValType;
+import com.dylibso.chicory.wasm.types.Value;
 import java.math.BigInteger;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -61,7 +68,8 @@ public final class Wasm implements AutoCloseable {
   private final Map<Integer, Execution> pendingExecutions = new LinkedHashMap<>();
   private final Set<Load> pendingLoads = ConcurrentHashMap.newKeySet();
   private final Runnable settleReferences = this::settleReferences;
-  private final WasmStore store = new WasmStore(this::checkInterruption, this::memoryChanged);
+  private final WasmStore store =
+      new WasmStore(this::checkInterruption, this::memoryChanged, this::internalize, value -> null);
   private final IdentityHashMap<Instance, Session> instances = new IdentityHashMap<>();
   private final AtomicBoolean closed = new AtomicBoolean();
   private QuickJS.Reference api;
@@ -92,6 +100,24 @@ public final class Wasm implements AutoCloseable {
   public QuickJS.Reference exports() {
     if (closed.get()) throw new IllegalStateException("WASM runtime is closed");
     return api;
+  }
+
+  public CompletableFuture<QuickJS.Reference> memory(SharedMemory memory) {
+    Objects.requireNonNull(memory, "memory");
+    return runtime.submit(
+        () -> {
+          if (closed.get()) throw new IllegalStateException("WASM runtime is closed");
+          WasmMemory value = store.memory(memory);
+          Object[] descriptor = describe(value);
+          try (QuickJS.Reference factory =
+              (QuickJS.Reference) runtime.reference("get", api, "memory").join()) {
+            return (QuickJS.Reference)
+                runtime.callFunction(factory, null, (Object) descriptor).join();
+          } catch (RuntimeException | Error error) {
+            store.release(((Number) descriptor[1]).intValue());
+            throw error;
+          }
+        });
   }
 
   private void install() {
@@ -213,6 +239,11 @@ public final class Wasm implements AutoCloseable {
     }
   }
 
+  private long internalize(long value) {
+    if (value < 0 || Value.isI31(value)) return value;
+    return gcAddress((Object[]) dispatcher.callDetached("internalize", value).join());
+  }
+
   private Object command(Object[] args) {
     String operation = (String) args[0];
     if (closed.get()) throw new IllegalStateException("WASM runtime is closed");
@@ -221,8 +252,10 @@ public final class Wasm implements AutoCloseable {
     executionChecks.push(check);
     try {
       return new Object[] {null, execute(operation, Arrays.copyOfRange(args, 1, args.length))};
-    } catch (HostFailure error) {
-      return new Object[] {"host", null};
+    } catch (WasmException error) {
+      return new Object[] {"exception", error.address(store.heap)};
+    } catch (ValueFailure error) {
+      return new Object[] {"TypeError", error.getMessage()};
     } catch (WasmLimitException error) {
       return new Object[] {"RangeError", error.getMessage()};
     } catch (ChicoryException error) {
@@ -254,6 +287,54 @@ public final class Wasm implements AutoCloseable {
             .customSections((String) a[1], this::checkInterruption);
       case "instance":
         return store.register(new Session(store.get(a[0], WasmModuleInfo.class)));
+      case "gcHandle":
+        return store.register(store.heap.retain(integer(a[0])));
+      case "tag":
+        return describe(
+            new TagInstance(
+                FunctionType.of(
+                    Arrays.stream((Object[]) a[0]).map(value -> type((String) value)).toList(),
+                    List.of())));
+      case "exception":
+        {
+          TagInstance tag = store.get(a[0], TagInstance.class);
+          Object[] values = (Object[]) a[1];
+          if (values.length != tag.type().params().size())
+            throw new ValueFailure("Invalid WASM exception payload count");
+          long[] payload = new long[values.length];
+          for (int i = 0; i < values.length; i++)
+            payload[i] = toValue(tag.type().params().get(i), tag.typeContext(), values[i]);
+          return new WasmException(tag, payload).address(store.heap);
+        }
+      case "exceptionInfo":
+        {
+          Object value = store.heap.get(integer(a[0]));
+          if (!(value instanceof WasmException exception))
+            throw new ValueFailure("Invalid WASM exception");
+          List<ValType> types = exception.tag().type().params();
+          Object[] values = new Object[types.size()];
+          for (int i = 0; i < values.length; i++)
+            values[i] =
+                WasmValues.name(types.get(i), exception.tag().typeContext()).equals("exnref")
+                    ? null
+                    : fromValue(
+                        types.get(i),
+                        exception.tag().typeContext(),
+                        exception.instance(),
+                        exception.args()[i]);
+          return new Object[] {describe(exception.tag()), values};
+        }
+      case "gcRoots":
+        {
+          var snapshot =
+              Boolean.TRUE.equals(a[0])
+                  ? store.heap.snapshot(store.get(a[1], Session.class).instance)
+                  : store.heap.snapshot(((Number) a[1]).longValue());
+          return new Object[] {
+            snapshot.externals().toArray(),
+            snapshot.functions().stream().map(value -> functionValue(value, null)).toArray()
+          };
+        }
       case "sessionMemory":
         {
           var memory = store.get(a[0], Session.class).instance.memory();
@@ -281,6 +362,8 @@ public final class Wasm implements AutoCloseable {
       case "link":
         store.get(a[0], Session.class).link(integer(a[1]), (Object[]) a[2]);
         return null;
+      case "globalImport":
+        return store.get(a[0], Session.class).literalGlobal(integer(a[1]), a[2]);
       case "prepare":
         return store.get(a[0], Session.class).prepare();
       case "resources":
@@ -294,9 +377,17 @@ public final class Wasm implements AutoCloseable {
       case "release":
         return release(integer(a[0]));
       case "memory":
-        return describe(store.memory(new MemoryLimits(integer(a[0]), integer(a[1]))));
+        return describe(
+            store.memory(
+                new MemoryLimits(
+                    integer(a[0]), integer(a[1]), a.length > 2 && Boolean.TRUE.equals(a[2]))));
       case "buffer":
-        return new QuickJS.DirectBuffer(store.get(a[0], WasmMemory.class).buffer(), false);
+        {
+          WasmMemory memory = store.get(a[0], WasmMemory.class);
+          return memory.shared()
+              ? new QuickJS.SharedBuffer(memory.buffer())
+              : new QuickJS.DirectBuffer(memory.buffer(), false);
+        }
       case "growMemory":
         return store.get(a[0], WasmMemory.class).grow(integer(a[1]));
       case "read":
@@ -326,28 +417,24 @@ public final class Wasm implements AutoCloseable {
       case "tableSet":
         {
           TableInstance table = store.get(a[0], TableInstance.class);
-          Object[] value = (Object[]) a[2];
-          table.setRef(
-              integer(a[1]),
-              integer(value[1]),
-              integer(value[0]) == 0 ? null : store.get(value[0], Session.class).instance);
+          Object[] value = tableElement(table, a[2]);
+          table.setRef(integer(a[1]), integer(value[0]), (Instance) value[1]);
           return null;
         }
       case "growTable":
         {
           TableInstance table = store.get(a[0], TableInstance.class);
-          Object[] value = (Object[]) a[2];
-          return table.grow(
-              integer(a[1]),
-              integer(value[1]),
-              integer(value[0]) == 0 ? null : store.get(value[0], Session.class).instance);
+          Object[] value = tableElement(table, a[2]);
+          return table.grow(integer(a[1]), integer(value[0]), (Instance) value[1]);
         }
       case "global":
         {
           ValType type = type((String) a[0]);
           return describe(
               new GlobalInstance(
-                  toWasm(type, a[2]),
+                  type.equals(ValType.FuncRef)
+                      ? functionAddress((Object[]) a[2])
+                      : toWasm(type, a[2]),
                   0,
                   type,
                   Boolean.TRUE.equals(a[1]) ? MutabilityType.Var : MutabilityType.Const));
@@ -355,14 +442,14 @@ public final class Wasm implements AutoCloseable {
       case "globalGet":
         {
           GlobalInstance global = store.get(a[0], GlobalInstance.class);
-          return fromWasm(global.getType(), global.getValueLow());
+          return globalValue(global);
         }
       case "globalSet":
         {
           GlobalInstance global = store.get(a[0], GlobalInstance.class);
           if (global.getMutabilityType() != MutabilityType.Var)
             throw new IllegalArgumentException("Immutable WASM global");
-          global.setValueLow(toWasm(global.getType(), a[1]));
+          global.setValueLow(toValue(global.getType(), global.typeContext(), a[1]));
           return null;
         }
       case "function":
@@ -468,6 +555,7 @@ public final class Wasm implements AutoCloseable {
         }
       }
       frame.close();
+      store.collectHeap();
       return released.toArray();
     }
   }
@@ -482,8 +570,10 @@ public final class Wasm implements AutoCloseable {
       session.disposed = true;
       if (session.activeExecutions != 0) return false;
       instances.remove(session.instance);
+      store.functions.release(session.instance);
     }
-    store.release(id);
+    Object released = store.release(id);
+    if (released instanceof GcRefStore.Handle handle) handle.close();
     return true;
   }
 
@@ -507,8 +597,7 @@ public final class Wasm implements AutoCloseable {
         updates.add(new Object[] {entry[0], BigInteger.valueOf(table.revision()), refs});
       } else {
         GlobalInstance global = (GlobalInstance) value;
-        updates.add(
-            new Object[] {entry[0], null, fromWasm(global.getType(), global.getValueLow())});
+        updates.add(new Object[] {entry[0], null, globalValue(global)});
       }
     }
     return updates.toArray();
@@ -516,20 +605,150 @@ public final class Wasm implements AutoCloseable {
 
   private Object[] describe(Object object) {
     int id = store.register(object);
-    if (object instanceof WasmMemory memory) return new Object[] {"memory", id};
+    if (object instanceof WasmMemory memory) return new Object[] {"memory", id, memory.shared()};
     if (object instanceof TableInstance table)
-      return new Object[] {"table", id, name(table.elementType())};
+      return new Object[] {
+        "table",
+        id,
+        WasmValues.name(table.elementType(), table.typeContext()),
+        table.elementType().isNullable()
+      };
+    if (object instanceof TagInstance tag)
+      return new Object[] {
+        "tag",
+        id,
+        tag.type().params().stream()
+            .map(value -> WasmValues.name(value, tag.typeContext()))
+            .toArray()
+      };
     GlobalInstance global = (GlobalInstance) object;
+    global.bindReferences(store.heap);
     return new Object[] {
-      "global", id, name(global.getType()), global.getMutabilityType() == MutabilityType.Var
+      "global",
+      id,
+      WasmValues.name(global.getType(), global.typeContext()),
+      global.getMutabilityType() == MutabilityType.Var
     };
   }
 
+  private String valueName(ValType type, Instance owner) {
+    Session session = owner == null ? null : instances.get(owner);
+    return session == null ? WasmValues.name(type, null) : session.compiled.valueName(type);
+  }
+
+  private int functionAddress(Object[] value) {
+    if (integer(value[1]) == -1) return -1;
+    Session session = store.get(value[0], Session.class);
+    if (session.disposed) throw new ValueFailure("WASM function instance is closed");
+    return store.functions.register(session.instance, integer(value[1]));
+  }
+
+  private Object[] functionValue(long value, Instance context) {
+    if (value == -1) return new Object[] {0, -1};
+    var function =
+        value < -1 ? store.functions.get((int) value) : context.functionReference((int) value);
+    Session session = instances.get(function.instance());
+    if (session == null || session.disposed)
+      throw new ValueFailure("WASM function instance is closed");
+    return new Object[] {store.register(session), function.index()};
+  }
+
+  private long gcAddress(Object[] value) {
+    return switch (integer(value[0])) {
+      case 0 -> ((Number) value[1]).longValue();
+      case 1 -> store.get(value[1], GcRefStore.Handle.class).address();
+      case 2 -> Value.encodeI31(integer(value[1]));
+      default -> throw new ValueFailure("Invalid WASM GC reference");
+    };
+  }
+
+  private Object[] gcValue(long value) {
+    if (value == -1 || value >= 0 && !Value.isI31(value))
+      return new Object[] {"extern", (int) value};
+    if (Value.isI31(value)) return new Object[] {"i31", Value.decodeI31S(value)};
+    var object = store.heap.get((int) value);
+    if (object instanceof WasmI31Ref i31)
+      return new Object[] {"i31", Value.decodeI31S(Value.encodeI31(i31.value()))};
+    if (object == null) throw new ValueFailure("WASM GC reference is no longer available");
+    return new Object[] {"gc", (int) value};
+  }
+
+  private Object globalValue(GlobalInstance global) {
+    return fromValue(
+        global.getType(), global.typeContext(), global.getInstance(), global.getValueLow());
+  }
+
+  private long toValue(ValType type, TypeSection context, Object value) {
+    String name = WasmValues.name(type, context);
+    if (name.equals("exnref"))
+      throw new ValueFailure("WASM exception references cannot be passed from JavaScript");
+    long encoded =
+        name.equals("funcref")
+            ? functionAddress((Object[]) value)
+            : name.equals("gcref") ? gcAddress((Object[]) value) : toWasm(type, value);
+    if (name.equals("funcref") && !store.functions.accepts(encoded, type, context)
+        || name.equals("gcref") && !store.heap.accepts(encoded, type, context)
+        || name.equals("externref")
+            && (encoded == -1 && !type.isNullable()
+                || encoded != -1 && type.typeIdx() == ValType.NoExternRef.typeIdx()))
+      throw new ValueFailure("Incompatible WASM reference value");
+    return encoded;
+  }
+
+  private Object fromValue(ValType type, TypeSection context, Instance owner, long value) {
+    String name = WasmValues.name(type, context);
+    if (name.equals("exnref"))
+      throw new ValueFailure("WASM exception references cannot be returned to JavaScript");
+    if (name.equals("funcref")) return functionValue(value, owner);
+    if (name.equals("gcref") || name.equals("externref") && (value < -1 || Value.isI31(value)))
+      return gcValue(value);
+    return fromWasm(type, value);
+  }
+
+  private long[] toValues(Session session, List<ValType> types, Object[] values) {
+    long[] result = new long[types.size()];
+    for (int i = 0; i < result.length; i++)
+      result[i] = toValue(types.get(i), session.compiled.module.typeSection(), values[i]);
+    return result;
+  }
+
+  private Object[] fromValues(Session session, List<ValType> types, long[] values) {
+    Object[] result = new Object[types.size()];
+    for (int i = 0; i < result.length; i++)
+      result[i] =
+          fromValue(
+              types.get(i), session.compiled.module.typeSection(), session.instance, values[i]);
+    return result;
+  }
+
+  private static final class ValueFailure extends RuntimeException {
+
+    ValueFailure(String message) {
+      super(message);
+    }
+  }
+
+  private Object[] tableElement(TableInstance table, Object encoded) {
+    String type = WasmValues.name(table.elementType(), table.typeContext());
+    Object value = type.equals("externref") ? ((Object[]) encoded)[1] : encoded;
+    long raw = toValue(table.elementType(), table.typeContext(), value);
+    if (type.equals("funcref") && raw != -1) {
+      var function = store.functions.get((int) raw);
+      return new Object[] {function.index(), function.instance()};
+    }
+    if (Value.isI31(raw))
+      raw = store.heap.put(table.typeContext(), new WasmI31Ref(Value.decodeI31U(raw)));
+    return new Object[] {(int) raw, null};
+  }
+
   private Object[] tableValue(TableInstance table, int index) {
-    int ref = table.ref(index);
-    Instance instance = table.instance(index);
-    Session session = instance == null ? null : instances.get(instance);
-    return new Object[] {session == null ? 0 : store.register(session), ref};
+    long raw = table.ref(index);
+    String type = WasmValues.name(table.elementType(), table.typeContext());
+    if (type.equals("funcref")) return functionValue(raw, table.instance(index));
+    if (type.equals("gcref")) return gcValue(raw);
+    return new Object[] {
+      0, fromValue(table.elementType(), table.typeContext(), table.instance(index), raw)
+    };
   }
 
   private final class Session {
@@ -544,6 +763,19 @@ public final class Wasm implements AutoCloseable {
 
     Session(WasmModuleInfo compiled) {
       this.compiled = compiled;
+    }
+
+    Object[] literalGlobal(int index, Object value) {
+      GlobalImport spec = (GlobalImport) compiled.module.importSection().getImport(index);
+      GlobalInstance global =
+          new GlobalInstance(
+              toValue(spec.type(), compiled.module.typeSection(), value),
+              0,
+              spec.type(),
+              spec.mutabilityType());
+      global.typeContext(compiled.module.typeSection());
+      global.bindReferences(store.heap);
+      return describeCreated(global);
     }
 
     void link(int index, Object[] value) {
@@ -569,16 +801,22 @@ public final class Wasm implements AutoCloseable {
                   type,
                   (owner, args) -> {
                     instance = owner;
-                    Object result =
-                        dispatcher
-                            .callDetached(
-                                "import",
-                                store.register(this),
-                                index,
-                                fromWasm(type.params(), args))
-                            .join();
-                    if (result == null) throw new HostFailure();
-                    return toWasm(type.returns(), (Object[]) result);
+                    Object[] result =
+                        (Object[])
+                            dispatcher
+                                .callDetached(
+                                    "import",
+                                    store.register(this),
+                                    index,
+                                    fromValues(this, type.params(), args))
+                                .join();
+                    if (integer(result[0]) != 0) {
+                      Object exception = store.heap.get(integer(result[1]));
+                      if (!(exception instanceof WasmException))
+                        throw new ValueFailure("Invalid WASM exception");
+                      throw (WasmException) exception;
+                    }
+                    return toValues(this, type.returns(), (Object[]) result[1]);
                   }));
       } else if (spec instanceof MemoryImport)
         imports.add(
@@ -590,6 +828,9 @@ public final class Wasm implements AutoCloseable {
         imports.add(
             new ImportGlobal(
                 spec.module(), spec.name(), store.get(value[0], GlobalInstance.class)));
+      else if (spec instanceof TagImport)
+        imports.add(
+            new ImportTag(spec.module(), spec.name(), store.get(value[0], TagInstance.class)));
     }
 
     Object[] prepare() {
@@ -612,7 +853,8 @@ public final class Wasm implements AutoCloseable {
         GlobalInstance global = instance.global(i);
         if (global != null) resources.add(describeCreated(global));
       }
-      if (instance.memory() != null) resources.add(describeCreated(instance.memory()));
+      for (int i = 0; i < compiled.memoryCount(); i++)
+        resources.add(describeCreated(instance.memory(i)));
       return resources.toArray();
     }
 
@@ -629,6 +871,7 @@ public final class Wasm implements AutoCloseable {
                       case MEMORY -> describeCreated(instance.memory(value.index()));
                       case TABLE -> describeCreated(instance.table(value.index()));
                       case GLOBAL -> describeCreated(instance.global(value.index()));
+                      case TAG -> describeCreated(instance.tag(value.index()));
                       default -> throw new InvalidException("Unsupported WASM export");
                     };
                 exports.add(new Object[] {value.name(), descriptor});
@@ -647,15 +890,21 @@ public final class Wasm implements AutoCloseable {
       int target = reference.index();
       FunctionType type = owner.compiled.functionType(target);
       return new Object[] {
-        "function", store.register(owner), target, names(type.params()), names(type.returns())
+        "function",
+        store.register(owner),
+        target,
+        owner.compiled.valueNames(type.params()),
+        owner.compiled.valueNames(type.returns())
       };
     }
 
     Object[] call(int index, Object[] arguments) {
       if (disposed || instance == null) throw new IllegalStateException("WASM instance is closed");
       FunctionType type = compiled.functionType(index);
-      return fromWasm(
-          type.returns(), instance.getMachine().call(index, toWasm(type.params(), arguments)));
+      return fromValues(
+          this,
+          type.returns(),
+          instance.getMachine().call(index, toValues(this, type.params(), arguments)));
     }
 
     void poll() {
@@ -663,10 +912,6 @@ public final class Wasm implements AutoCloseable {
       if (closed.get() || disposed) throw new IllegalStateException("WASM instance is closed");
       checkInterruption();
     }
-  }
-
-  private static final class HostFailure extends RuntimeException {
-
   }
 
   @Override

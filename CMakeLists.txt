@@ -54,11 +54,18 @@ else()
     target_link_libraries(quickjs-core PUBLIC Threads::Threads "${CMAKE_DL_LIBS}" m)
 endif()
 
-add_library(quickjs-wrapper SHARED native/quickjs_jni.cpp native/console.cpp)
+add_library(quickjs-wrapper SHARED native/quickjs_jni.cpp native/console.cpp native/shared_memory.cpp)
 set_target_properties(quickjs-wrapper PROPERTIES
     CXX_VISIBILITY_PRESET hidden
     VISIBILITY_INLINES_HIDDEN ON
 )
+set(QUICKJS_JNI_HEADERS "${CMAKE_CURRENT_SOURCE_DIR}/build/generated/jni" CACHE PATH "Generated Java native headers")
+if(NOT EXISTS "${QUICKJS_JNI_HEADERS}/com_fongmi_quickjs_QuickJS.h" OR
+   NOT EXISTS "${QUICKJS_JNI_HEADERS}/com_fongmi_quickjs_SharedMemory.h")
+    message(FATAL_ERROR "Generate matching JNI headers with Gradle compileJava before building native code")
+endif()
+target_include_directories(quickjs-wrapper PRIVATE "${QUICKJS_JNI_HEADERS}")
+
 target_link_libraries(quickjs-wrapper PRIVATE quickjs-core)
 
 if(QUICKJS_ENABLE_THIN_LTO)

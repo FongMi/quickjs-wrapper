@@ -1,4 +1,5 @@
 #include <jni.h>
+#include "com_fongmi_quickjs_QuickJS.h"
 
 #include <cstdio>
 #include <cstring>
