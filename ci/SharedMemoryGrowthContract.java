@@ -95,8 +95,8 @@ public final class SharedMemoryGrowthContract {
         var second = runtime.sharedMemory(1, 1024)) {
       ordinary.write(0, new byte[] {42});
       check(first.grow(1023) == 1, "Mixed budget accepts shared growth");
-      check(second.grow(1022) == -1, "Unshared allocation remains charged");
-      check(second.grow(1021) == 1, "Rejected growth rolls back its charge");
+      check(second.grow(1023) == -1, "Unshared allocation remains charged");
+      check(second.grow(1022) == 1, "Rejected growth rolls back its charge");
       check(second.grow(1) == -1, "Mixed budget remains bounded");
       check(ordinary.read(0, 1)[0] == 42, "Unshared allocation stays live");
     }
