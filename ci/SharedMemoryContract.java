@@ -86,10 +86,44 @@ public final class SharedMemoryContract {
     return Long.parseLong(match.group(1));
   }
 
+  private static void nativeBuffers() throws Exception {
+    try (QuickJS runtime = new QuickJS()) {
+      for (int length : new int[] {0, 8}) {
+        try (var reference =
+                (QuickJS.Reference)
+                    runtime
+                        .reference(
+                            "evaluateReference",
+                            "globalThis.nativeBuffer=new SharedArrayBuffer("
+                                + length
+                                + "); nativeBuffer",
+                            "<native-shared-buffer>",
+                            false)
+                        .get(5, TimeUnit.SECONDS);
+            var lease = runtime.leaseBuffer(reference).get(5, TimeUnit.SECONDS)) {
+          if (length != 0) js(runtime, "Atomics.store(new Uint8Array(nativeBuffer),3,42)");
+          reference.close();
+          js(runtime, "delete globalThis.nativeBuffer");
+          runtime.reference("gc").get(5, TimeUnit.SECONDS);
+          lease
+              .use(
+                  view -> {
+                    check(
+                        view.isDirect() && view.remaining() == length,
+                        "Native shared buffer range");
+                    if (length != 0) check(view.get(3) == 42, "Native shared lease survives GC");
+                  })
+              .get(5, TimeUnit.SECONDS);
+        }
+      }
+    }
+  }
+
   public static void main(String[] args) throws Exception {
     binary = Files.readAllBytes(Path.of(args[0]));
     try (QuickJS observer = new QuickJS()) {
       long roots = resource(observer, "jniGlobalRefs");
+      nativeBuffers();
       SharedMemory shared = SharedMemory.allocate(1, 4);
       try (WasmRuntime java = new WasmRuntime();
           var module = java.compile(binary);
