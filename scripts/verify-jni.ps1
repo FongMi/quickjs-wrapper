@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][string] $JavaJar,
-    [Parameter(Mandatory)][string[]] $Symbols
+    [Parameter(Mandatory)][AllowEmptyString()][string[]] $Symbols
 )
 
 $ErrorActionPreference = 'Stop'

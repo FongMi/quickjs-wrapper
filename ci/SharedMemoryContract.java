@@ -48,7 +48,24 @@ public final class SharedMemoryContract {
 
   private static CompletableFuture<Integer> waitQueued(
       SharedMemory memory, java.util.concurrent.CountDownLatch queued) {
-    return CompletableFuture.supplyAsync(() -> memory.waitOn(0, 4, 0, -1, queued::countDown));
+    return waitQueued(memory, queued, () -> {});
+  }
+
+  private static CompletableFuture<Integer> waitQueued(
+      SharedMemory memory, java.util.concurrent.CountDownLatch queued, Runnable check) {
+    var checks = new java.util.concurrent.atomic.AtomicInteger();
+    return CompletableFuture.supplyAsync(
+        () ->
+            memory.waitOn(
+                0,
+                4,
+                0,
+                -1,
+                () -> {
+                  check.run();
+                  // The first check is preflight; native checks run after enqueueing.
+                  if (checks.incrementAndGet() == 2) queued.countDown();
+                }));
   }
 
   private static void notifyUntil(
@@ -142,6 +159,25 @@ public final class SharedMemoryContract {
         check(instance.call("grow", 1)[0].equals(1), "WASM shared growth");
         notifyUntil(instance, growingWait);
         check(growingWait.get(5, TimeUnit.SECONDS) == 0, "Shared growth preserves the wait queue");
+        var cancelQueued = new java.util.concurrent.CountDownLatch(1);
+        var cancelRequested = new java.util.concurrent.atomic.AtomicBoolean();
+        var cancellation = new java.util.concurrent.CancellationException("Queued wait canceled");
+        CompletableFuture<Integer> nativeCanceled =
+            waitQueued(
+                shared,
+                cancelQueued,
+                () -> {
+                  if (cancelRequested.get()) throw cancellation;
+                });
+        check(cancelQueued.await(5, TimeUnit.SECONDS), "Cancelable native waiter queued");
+        cancelRequested.set(true);
+        try {
+          nativeCanceled.get(5, TimeUnit.SECONDS);
+          throw new AssertionError("Queued native wait ignored cancellation");
+        } catch (ExecutionException error) {
+          check(error.getCause() == cancellation, "Queued wait preserves the original exception");
+        }
+        check(instance.call("notify", 1)[0].equals(0), "Queued cancellation removes the waiter");
         instance.call("fence");
         js(js, "api.fence()");
         check(
