@@ -37,6 +37,11 @@ jobs:
           distribution: temurin
           java-version: '21'
           cache: gradle
+      - name: Verify bundled Chicory runtime
+        shell: pwsh
+        run: |
+          chmod +x ./gradlew
+          ./scripts/verify-chicory.ps1
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: '24'
@@ -65,9 +70,9 @@ jobs:
           cp build/libs/*.jar artifacts/
           cp runtime/build/outputs/aar/runtime-release.aar artifacts/
           python - <<'PY'
-          import json, os, pathlib, subprocess
+          import hashlib, json, os, pathlib, subprocess
           revision = lambda directory: subprocess.check_output(['git', '-C', directory, 'rev-parse', 'HEAD'], text=True).strip()
-          info = {'wrapperCommit': revision('.'), 'quickjsCommit': revision('vendor/quickjs'), 'runId': os.environ['GITHUB_RUN_ID']}
+          info = {'wrapperCommit': revision('.'), 'quickjsCommit': revision('vendor/quickjs'), 'chicoryCommit': revision('vendor/chicory'), 'chicoryJarSHA256': hashlib.sha256(pathlib.Path('libs/chicory-runtime-android.jar').read_bytes()).hexdigest(), 'runId': os.environ['GITHUB_RUN_ID']}
           pathlib.Path('artifacts/BUILD_INFO.json').write_text(json.dumps(info, indent=2) + '\n')
           PY
           cd artifacts
@@ -96,6 +101,9 @@ jobs:
           distribution: temurin
           java-version: '21'
           cache: gradle
+      - name: Verify bundled Chicory runtime
+        shell: pwsh
+        run: ./scripts/verify-chicory.ps1
       - name: Build host JNI library
         shell: pwsh
         env:
@@ -131,6 +139,8 @@ jobs:
           [ordered]@{
             wrapperCommit = (git rev-parse HEAD)
             quickjsCommit = (git -C vendor/quickjs rev-parse HEAD)
+            chicoryCommit = (git -C vendor/chicory rev-parse HEAD)
+            chicoryJarSHA256 = (Get-FileHash libs/chicory-runtime-android.jar -Algorithm SHA256).Hash.ToLowerInvariant()
             runId = $env:GITHUB_RUN_ID
           } | ConvertTo-Json | Set-Content artifacts/BUILD_INFO.json -Encoding utf8
           Get-FileHash artifacts/* -Algorithm SHA256 |

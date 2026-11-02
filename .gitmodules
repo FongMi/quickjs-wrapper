@@ -2,3 +2,7 @@
 	path = vendor/quickjs
 	url = https://github.com/FongMi/quickjs.git
 	branch = fongmi
+[submodule "vendor/chicory"]
+	path = vendor/chicory
+	url = https://github.com/FongMi/chicory.git
+	branch = fongmi
