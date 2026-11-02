@@ -102,6 +102,46 @@ public final class SharedMemoryGrowthContract {
     }
   }
 
+  private static void creatorClose() throws Exception {
+    try (WasmRuntime creator = new WasmRuntime();
+        WasmRuntime consumer = new WasmRuntime()) {
+      var source = creator.sharedMemory(1, 4);
+      var shared = source.sharedMemory();
+      var old = shared.buffer();
+      try (var imported = consumer.memory(shared)) {
+        creator.close();
+        check(imported.grow(1) == 1, "Imported backing grows after creator closes");
+        imported.write(PAGE, new byte[] {42});
+        old.use(bytes -> check(bytes.remaining() == PAGE, "Creator's old view remains fixed"));
+        shared
+            .buffer()
+            .use(bytes -> check(bytes.get(PAGE) == 42, "Creator close preserves backing"));
+      }
+    }
+  }
+
+  private record Borrow(
+      SharedMemory.Pin pin, ByteBuffer bytes, WeakReference<SharedMemory> owner) {}
+
+  private static Borrow borrow() {
+    SharedMemory memory = SharedMemory.allocate(1, 4);
+    return new Borrow(memory.pin(), memory.view(), new WeakReference<>(memory));
+  }
+
+  private static void pinnedOwnerGc() throws Exception {
+    Borrow borrowed = borrow();
+    try (var pin = borrowed.pin()) {
+      long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+      while (borrowed.owner().get() != null) {
+        check(System.nanoTime() < deadline, "Borrow does not retain the Java owner");
+        System.gc();
+        Thread.sleep(10);
+      }
+      borrowed.bytes().putInt(0, 42);
+      check(borrowed.bytes().getInt(0) == 42, "Native pin protects access after owner GC");
+    }
+  }
+
   private static void concurrentGrowth() throws Exception {
     SharedMemory shared = SharedMemory.allocate(1, 128);
     var old = shared.buffer();
@@ -282,6 +322,10 @@ public final class SharedMemoryGrowthContract {
       sparseQuota(observer);
       released(observer, roots);
       mixedQuota();
+      released(observer, roots);
+      creatorClose();
+      released(observer, roots);
+      pinnedOwnerGc();
       released(observer, roots);
       concurrentGrowth();
       released(observer, roots);
