@@ -458,13 +458,13 @@ public final class QuickJS implements AutoCloseable {
             new LinkedBlockingQueue<>(),
             work -> {
               Thread thread =
-                  new Thread(
+                  infrastructureThread(
                       () -> {
                         ownerThread = Thread.currentThread();
                         work.run();
                       },
                       "QuickJS-" + NEXT_RUNTIME.incrementAndGet());
-              thread.setDaemon(true);
+              thread.setContextClassLoader(Thread.currentThread().getContextClassLoader());
               return thread;
             });
     try {

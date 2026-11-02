@@ -170,6 +170,33 @@ public final class SharedMemoryGrowthContract {
     }
   }
 
+  private static WeakReference<QuickJS.BufferLease> inheritedOwner() throws Exception {
+    Object[] context = new Object[1];
+    ClassLoader previous = Thread.currentThread().getContextClassLoader();
+    ClassLoader loader = new ClassLoader(previous) {};
+    Thread.currentThread().setContextClassLoader(loader);
+    CONTEXT.set(context);
+    try (QuickJS runtime = new QuickJS();
+        var reference =
+            (QuickJS.Reference)
+                runtime
+                    .reference(
+                        "evaluateReference", "new SharedArrayBuffer(8)", "<inherited-owner>", false)
+                    .get(5, TimeUnit.SECONDS)) {
+      check(
+          runtime
+              .submit(() -> Thread.currentThread().getContextClassLoader() == loader)
+              .get(5, TimeUnit.SECONDS),
+          "Owner preserves caller context ClassLoader");
+      var lease = runtime.leaseBuffer(reference).get(5, TimeUnit.SECONDS);
+      context[0] = lease;
+      return new WeakReference<>(lease);
+    } finally {
+      CONTEXT.remove();
+      Thread.currentThread().setContextClassLoader(previous);
+    }
+  }
+
   private static void infrastructureGc(QuickJS observer, long roots) throws Exception {
     var lease = inheritedLease();
     released(observer, roots);
@@ -177,6 +204,10 @@ public final class SharedMemoryGrowthContract {
     var memory = inheritedDeadline();
     released(observer, roots);
     check(memory.get() == null, "Deadline worker must not retain inherited caller context");
+    var ownerLease = inheritedOwner();
+    released(observer, roots);
+    check(
+        ownerLease.get() == null, "Closed runtime owner must not retain inherited caller context");
   }
 
   private static void mixedQuota() throws Exception {
