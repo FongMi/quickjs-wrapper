@@ -112,8 +112,10 @@ jobs:
           }
           cmake @configure
           if ($LASTEXITCODE) { throw 'Host JNI configuration failed.' }
-          cmake --build "$env:RUNNER_TEMP/quickjs-host" --config Release --target quickjs-wrapper --parallel 4
+          cmake --build "$env:RUNNER_TEMP/quickjs-host" --config Release --target quickjs-wrapper virtual-memory-contract --parallel 4
           if ($LASTEXITCODE) { throw 'Host JNI build failed.' }
+          & "$env:RUNNER_TEMP/quickjs-host/Release/virtual-memory-contract.exe"
+          if ($LASTEXITCODE) { throw 'Native virtual-memory regression failed.' }
           $readobj = Join-Path $env:ProgramFiles 'LLVM/bin/llvm-readobj.exe'
           if (!(Test-Path -LiteralPath $readobj)) {
             $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'

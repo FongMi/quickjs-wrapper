@@ -385,7 +385,7 @@ public final class Wasm implements AutoCloseable {
         {
           WasmMemory memory = store.get(a[0], WasmMemory.class);
           return memory.shared()
-              ? new QuickJS.SharedBuffer(memory.buffer())
+              ? memory.backing().buffer()
               : new QuickJS.DirectBuffer(memory.buffer(), false);
         }
       case "growMemory":

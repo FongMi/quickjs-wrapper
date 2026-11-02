@@ -12,8 +12,13 @@ if (!$OutputDirectory) { $OutputDirectory = Join-Path $repository 'build/shared-
 New-Item -ItemType Directory -Force -Path $OutputDirectory | Out-Null
 $javac = if ($env:JAVA_HOME) { Join-Path $env:JAVA_HOME $(if ($IsWindows) { 'bin/javac.exe' } else { 'bin/javac' }) } else { 'javac' }
 $java = if ($env:JAVA_HOME) { Join-Path $env:JAVA_HOME $(if ($IsWindows) { 'bin/java.exe' } else { 'bin/java' }) } else { 'java' }
-& $javac --release 17 -cp $JavaJar -d $OutputDirectory (Join-Path $repository 'ci/SharedMemoryContract.java')
+$sources = @('ci/SharedMemoryContract.java', 'ci/MemoryBudgetContract.java', 'ci/SharedMemoryGrowthContract.java') | ForEach-Object { Join-Path $repository $_ }
+& $javac --release 17 -cp $JavaJar -d $OutputDirectory @sources
 if ($LASTEXITCODE) { throw 'Shared-memory regression compilation failed.' }
 $separator = [IO.Path]::PathSeparator
+& $java -cp "$OutputDirectory$separator$JavaJar" com.fongmi.quickjs.MemoryBudgetContract
+if ($LASTEXITCODE) { throw 'Memory-budget regression failed.' }
 & $java '-Xcheck:jni' "-Djava.library.path=$NativeDirectory" -cp "$OutputDirectory$separator$JavaJar" com.fongmi.quickjs.SharedMemoryContract (Join-Path $repository 'ci/shared-memory.wasm')
 if ($LASTEXITCODE) { throw 'Shared-memory regression failed.' }
+& $java '-Xcheck:jni' "-Djava.library.path=$NativeDirectory" -cp "$OutputDirectory$separator$JavaJar" com.fongmi.quickjs.SharedMemoryGrowthContract
+if ($LASTEXITCODE) { throw 'Shared-memory growth regression failed.' }
