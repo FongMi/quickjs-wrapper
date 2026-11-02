@@ -1,4 +1,5 @@
 #include "shared_memory.h"
+#include "virtual_memory.h"
 #include "com_fongmi_quickjs_SharedMemory.h"
 
 #include <algorithm>
@@ -35,6 +36,7 @@ struct Allocation {
     std::shared_ptr<Budget> budget;
     JavaVM *vm;
     jobject buffer;
+    std::unique_ptr<VirtualMemory> memory;
 };
 std::atomic<int64_t> buffer_roots{0};
 std::mutex allocations_mutex;
@@ -141,11 +143,76 @@ void release_shared_buffer(void *data) {
         allocation = std::move(found->second);
         allocations.erase(found);
     }
-    if (allocation.buffer) delete_buffer_root(allocation.vm, allocation.buffer);
+    if (allocation.memory) {
+        allocation.memory.reset();
+        delete_buffer_root(allocation.vm, allocation.buffer);
+    } else if (allocation.buffer) delete_buffer_root(allocation.vm, allocation.buffer);
     else {
         allocation.budget->bytes.fetch_sub(allocation.size);
         std::free(data);
     }
+}
+
+jobject allocate_shared_memory(JNIEnv *env, jint capacity, jint size, jobject charge) {
+    if (capacity <= 0 || capacity > MAX_BUFFER || size < 0 || size > capacity || (size % VirtualMemory::WASM_PAGE_SIZE) || !charge) {
+        throw_argument(env, "Invalid shared memory reservation");
+        return nullptr;
+    }
+    auto memory = VirtualMemory::allocate(static_cast<size_t>(capacity), static_cast<size_t>(size));
+    if (!memory) {
+        jclass type = env->FindClass("com/fongmi/quickjs/WasmLimitException");
+        if (type) { env->ThrowNew(type, "Cannot reserve or commit shared WASM memory"); env->DeleteLocalRef(type); }
+        return nullptr;
+    }
+    jobject buffer = env->NewDirectByteBuffer(memory->data(), capacity);
+    if (!buffer) return nullptr;
+    jobject root = env->NewGlobalRef(charge);
+    if (!root) { env->DeleteLocalRef(buffer); return nullptr; }
+    JavaVM *vm = nullptr;
+    env->GetJavaVM(&vm);
+    try {
+        std::lock_guard<std::mutex> lock(allocations_mutex);
+        void *data = memory->data();
+        auto entry = allocations.emplace(data, Allocation{1, static_cast<size_t>(capacity), nullptr, vm, root, std::move(memory)});
+        assert(entry.second);
+        if (!entry.second) std::abort();
+    } catch (const std::bad_alloc &) {
+        env->DeleteGlobalRef(root);
+        env->DeleteLocalRef(buffer);
+        jclass type = env->FindClass("java/lang/OutOfMemoryError");
+        if (type) { env->ThrowNew(type, "Cannot track shared memory reservation"); env->DeleteLocalRef(type); }
+        return nullptr;
+    }
+    buffer_roots.fetch_add(1);
+    return buffer;
+}
+
+bool grow_shared_memory(JNIEnv *env, jobject storage, jint size) {
+    if (!storage) { throw_argument(env, "Shared storage is required"); return false; }
+    void *data = env->GetDirectBufferAddress(storage);
+    std::lock_guard<std::mutex> lock(allocations_mutex);
+    auto found = allocations.find(data);
+    if (found == allocations.end() || !found->second.memory || size < 0 || (size % VirtualMemory::WASM_PAGE_SIZE)) {
+        throw_argument(env, "Invalid shared memory growth");
+        return false;
+    }
+    return found->second.memory->grow(static_cast<size_t>(size));
+}
+
+size_t shared_reserved_bytes() {
+    std::lock_guard<std::mutex> lock(allocations_mutex);
+    size_t bytes = 0;
+    for (const auto &entry : allocations)
+        if (entry.second.memory) bytes += entry.second.memory->capacity();
+    return bytes;
+}
+
+size_t shared_committed_bytes() {
+    std::lock_guard<std::mutex> lock(allocations_mutex);
+    size_t bytes = 0;
+    for (const auto &entry : allocations)
+        if (entry.second.memory) bytes += entry.second.memory->size();
+    return bytes;
 }
 
 JSValue shared_buffer(JNIEnv *env, JSContext *context, jobject buffer) {

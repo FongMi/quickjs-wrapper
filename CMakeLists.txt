@@ -54,7 +54,7 @@ else()
     target_link_libraries(quickjs-core PUBLIC Threads::Threads "${CMAKE_DL_LIBS}" m)
 endif()
 
-add_library(quickjs-wrapper SHARED native/quickjs_jni.cpp native/console.cpp native/shared_memory.cpp)
+add_library(quickjs-wrapper SHARED native/quickjs_jni.cpp native/console.cpp native/shared_memory.cpp native/virtual_memory.cpp)
 set_target_properties(quickjs-wrapper PROPERTIES
     CXX_VISIBILITY_PRESET hidden
     VISIBILITY_INLINES_HIDDEN ON
@@ -92,6 +92,8 @@ if(ANDROID)
 else()
     find_package(JNI REQUIRED)
     target_include_directories(quickjs-wrapper PRIVATE ${JNI_INCLUDE_DIRS})
+    add_executable(virtual-memory-contract ci/VirtualMemoryContract.cpp native/virtual_memory.cpp)
+    target_include_directories(virtual-memory-contract PRIVATE native)
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/native/tests/CMakeLists.txt")
         include(native/tests/CMakeLists.txt)
     endif()
