@@ -6,9 +6,14 @@ import com.dylibso.chicory.runtime.ImportFunction;
 import com.dylibso.chicory.runtime.ImportGlobal;
 import com.dylibso.chicory.runtime.ImportMemory;
 import com.dylibso.chicory.runtime.ImportTable;
+import com.dylibso.chicory.runtime.ImportTag;
 import com.dylibso.chicory.runtime.ImportValue;
 import com.dylibso.chicory.runtime.TableInstance;
+import com.dylibso.chicory.runtime.TagInstance;
+import com.dylibso.chicory.runtime.WasmException;
+import com.dylibso.chicory.runtime.WasmI31Ref;
 import com.dylibso.chicory.runtime.WasmRuntimeException;
+import com.dylibso.chicory.runtime.internal.GcRefStore;
 import com.dylibso.chicory.wasm.ChicoryException;
 import com.dylibso.chicory.wasm.UninstantiableException;
 import com.dylibso.chicory.wasm.types.ExternalType;
@@ -20,9 +25,11 @@ import com.dylibso.chicory.wasm.types.MemoryLimits;
 import com.dylibso.chicory.wasm.types.MutabilityType;
 import com.dylibso.chicory.wasm.types.TableImport;
 import com.dylibso.chicory.wasm.types.TableLimits;
+import com.dylibso.chicory.wasm.types.TagImport;
+import com.dylibso.chicory.wasm.types.TypeSection;
 import com.dylibso.chicory.wasm.types.ValType;
+import com.dylibso.chicory.wasm.types.Value;
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.HashSet;
 import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
@@ -45,6 +52,8 @@ public final class WasmRuntime implements AutoCloseable {
     F32("f32"),
     F64("f64"),
     EXTERNREF("externref"),
+    GCREF("gcref"),
+    EXNREF("exnref"),
     FUNCREF("funcref");
 
     private final String name;
@@ -58,7 +67,8 @@ public final class WasmRuntime implements AutoCloseable {
     FUNCTION,
     MEMORY,
     TABLE,
-    GLOBAL
+    GLOBAL,
+    TAG
   }
 
   public record Signature(List<Type> params, List<Type> results) {
@@ -128,21 +138,25 @@ public final class WasmRuntime implements AutoCloseable {
     final long started = System.nanoTime();
     final AtomicBoolean canceled = new AtomicBoolean();
     final Map<Instance, Integer> participants = new java.util.concurrent.ConcurrentHashMap<>();
+    final List<Object> roots = new ArrayList<>();
     long deadline = Long.MAX_VALUE;
   }
 
   private final ReentrantLock lock = new ReentrantLock();
   private final AtomicBoolean closed = new AtomicBoolean();
-  private final WasmStore store = new WasmStore(this::check, memory -> {});
+  private final WasmStore store =
+      new WasmStore(
+          this::check,
+          memory -> {},
+          value -> value,
+          value -> referenceValue(Math.toIntExact(value)));
   private final Set<Module> modules = new HashSet<>();
   private final Set<Resource> resources = new HashSet<>();
   private final Map<com.dylibso.chicory.runtime.Instance, Instance> instances =
       new IdentityHashMap<>();
-  private final Map<Integer, Object> references = new HashMap<>();
-  private final Map<Object, Integer> referenceIds = new IdentityHashMap<>();
+  private final WasmReferences references = new WasmReferences();
   private final ConcurrentLinkedQueue<Runnable> closing = new ConcurrentLinkedQueue<>();
   private volatile Call active;
-  private int nextReference;
 
   public Module compile(byte[] binary) throws Exception {
     return compileTimed(0, binary);
@@ -218,37 +232,78 @@ public final class WasmRuntime implements AutoCloseable {
         0, () -> new Memory(store.memory(new MemoryLimits(initialPages, maximumPages)), null));
   }
 
-  public Global global(Type type, boolean mutable, Object value) throws Exception {
-    if (type == Type.FUNCREF)
-      throw new IllegalArgumentException("WASM function globals are not supported");
+  public Memory sharedMemory(int initialPages, int maximumPages) throws Exception {
     return create(
         0,
+        () -> new Memory(store.memory(new MemoryLimits(initialPages, maximumPages, true)), null));
+  }
+
+  public Memory memory(SharedMemory memory) throws Exception {
+    Objects.requireNonNull(memory, "memory");
+    return create(0, () -> new Memory(store.memory(memory), null));
+  }
+
+  public Tag tag(List<Type> parameters) throws Exception {
+    List<Type> types = List.copyOf(parameters);
+    return execute(
+        0,
         () ->
-            new Global(
-                new GlobalInstance(
-                    encode(type, value),
-                    0,
-                    backendType(type),
-                    mutable ? MutabilityType.Var : MutabilityType.Const),
+            new Tag(
+                new TagInstance(
+                    FunctionType.of(
+                        types.stream().map(WasmRuntime::backendType).toList(), List.of())),
                 null));
   }
 
+  public ExceptionValue exception(Tag tag, Object... arguments) throws Exception {
+    requireOwner(tag.owner());
+    return execute(
+        0,
+        () -> {
+          TagInstance value = (TagInstance) tag.requireOpen();
+          List<Type> types =
+              value.type().params().stream()
+                  .map(type -> valueType(type, value.typeContext()))
+                  .toList();
+          long[] encoded = encode(types, arguments);
+          for (int i = 0; i < encoded.length; i++)
+            validateValue(value.type().params().get(i), value.typeContext(), encoded[i]);
+          return new ExceptionValue(new WasmException(value, encoded));
+        });
+  }
+
+  public Global global(Type type, boolean mutable, Object value) throws Exception {
+    return create(
+        0,
+        () -> {
+          ValType backend = backendType(type);
+          long encoded = encode(type, value);
+          validateValue(backend, null, encoded);
+          return new Global(
+              new GlobalInstance(
+                  encoded, 0, backend, mutable ? MutabilityType.Var : MutabilityType.Const),
+              null);
+        });
+  }
+
   public Table table(Type type, int initial, int maximum, Object value) throws Exception {
-    if (type != Type.FUNCREF && type != Type.EXTERNREF)
+    ValType backend = backendType(type);
+    if (!backend.isReference())
       throw new IllegalArgumentException("WASM table requires a reference type");
     return create(
         0,
         () -> {
+          long encoded = encode(type, value);
+          validateValue(backend, null, encoded);
           Function function = functionValue(type, value);
-          int ref =
-              type == Type.EXTERNREF ? reference(value) : function == null ? -1 : function.index;
-          var owner = function == null ? null : function.instance.backend;
+          if (Value.isI31(encoded))
+            encoded = store.heap.put((TypeSection) null, new WasmI31Ref(Value.decodeI31U(encoded)));
           return new Table(
               store.table(
                   new com.dylibso.chicory.wasm.types.Table(
-                      backendType(type), new TableLimits(initial, maximum)),
-                  ref,
-                  owner),
+                      backend, new TableLimits(initial, maximum)),
+                  function == null ? (int) encoded : function.index,
+                  function == null ? null : function.instance.backend),
               null);
         });
   }
@@ -315,6 +370,15 @@ public final class WasmRuntime implements AutoCloseable {
       result = operation.run();
       check();
       return result;
+    } catch (WasmException error) {
+      if (error instanceof ForeignException foreign) {
+        failure = foreign.failure;
+        if (failure instanceof Exception original) throw original;
+        throw (Error) failure;
+      }
+      ExceptionValue mapped = new ExceptionValue(error);
+      failure = mapped;
+      throw mapped;
     } catch (Signal signal) {
       failure = signal.failure;
       if (failure instanceof Exception error) throw error;
@@ -381,8 +445,9 @@ public final class WasmRuntime implements AutoCloseable {
     if (owner != this) throw new LinkException("WASM values belong to another runtime");
   }
 
-  private static Type publicType(ValType type) {
-    for (Type value : Type.values()) if (WasmValues.type(value.name).equals(type)) return value;
+  private static Type publicType(ValType type, WasmModuleInfo info) {
+    String name = info == null ? WasmValues.name(type, null) : info.valueName(type);
+    for (Type value : Type.values()) if (value.name.equals(name)) return value;
     throw new IllegalArgumentException("Unsupported WASM type: " + type);
   }
 
@@ -390,22 +455,57 @@ public final class WasmRuntime implements AutoCloseable {
     return WasmValues.type(Objects.requireNonNull(type, "type").name);
   }
 
-  private static Signature signature(FunctionType type) {
+  private static Signature signature(WasmModuleInfo info, FunctionType type) {
     return new Signature(
-        type.params().stream().map(WasmRuntime::publicType).toList(),
-        type.returns().stream().map(WasmRuntime::publicType).toList());
+        type.params().stream().map(value -> publicType(value, info)).toList(),
+        type.returns().stream().map(value -> publicType(value, info)).toList());
+  }
+
+  private static Type valueType(ValType value, TypeSection context) {
+    String name = WasmValues.name(value, context);
+    for (Type type : Type.values()) if (type.name.equals(name)) return type;
+    throw new IllegalArgumentException("Unsupported WASM type: " + name);
+  }
+
+  private void validateValue(ValType type, TypeSection context, long value) {
+    String name = WasmValues.name(type, context);
+    if (name.equals("funcref") && !store.functions.accepts(value, type, context)
+        || (name.equals("gcref") || name.equals("exnref"))
+            && !store.heap.accepts(value, type, context)
+        || name.equals("externref")
+            && (value == -1 && !type.isNullable()
+                || value != -1 && type.typeIdx() == ValType.NoExternRef.typeIdx()))
+      throw new IllegalArgumentException("Incompatible WASM reference value");
+  }
+
+  private Type publicType(GlobalInstance global) {
+    return valueType(global.getType(), global.typeContext());
   }
 
   private int reference(Object value) {
-    if (value == null) return -1;
-    Integer old = referenceIds.get(value);
-    if (old != null) return old;
-    if (nextReference == Integer.MAX_VALUE)
-      throw new IllegalStateException("WASM reference budget exhausted");
-    int id = ++nextReference;
-    referenceIds.put(value, id);
-    references.put(id, value);
-    return id;
+    if (active != null) active.roots.add(value);
+    return references.id(value);
+  }
+
+  private long gcAddress(Object value) {
+    if (value instanceof Reference reference) {
+      requireOwner(reference.owner());
+      if (active != null) active.roots.add(reference);
+      return reference.address();
+    }
+    if (value instanceof Integer number && number >= -0x40000000 && number < 0x40000000)
+      return Value.encodeI31(number);
+    return reference(value);
+  }
+
+  private Object gcValue(long value) {
+    if (value == -1) return null;
+    if (Value.isI31(value)) return Value.decodeI31S(value);
+    if (value >= 0) return referenceValue((int) value);
+    var object = store.heap.get((int) value);
+    if (object instanceof WasmI31Ref i31) return Value.decodeI31S(Value.encodeI31(i31.value()));
+    if (object == null) throw new IllegalStateException("WASM GC reference is no longer available");
+    return new Reference(store.heap.retain((int) value));
   }
 
   private long encode(Type type, Object value) {
@@ -426,8 +526,22 @@ public final class WasmRuntime implements AutoCloseable {
         if (!(value instanceof Double)) throw new IllegalArgumentException("f64 requires Double");
         yield Double.doubleToRawLongBits((Double) value);
       }
-      case EXTERNREF -> reference(value);
-      case FUNCREF -> throw new IllegalArgumentException("WASM function values require a table");
+      case EXTERNREF -> value instanceof Reference ? gcAddress(value) : reference(value);
+      case GCREF -> gcAddress(value);
+      case EXNREF ->
+          value == null
+              ? -1
+              : value instanceof Reference reference
+                  ? gcAddress(reference)
+                  : value instanceof ExceptionValue exception && exception.owner() == this
+                      ? exception.address()
+                      : invalidExceptionReference();
+      case FUNCREF -> {
+        Function function = functionValue(type, value);
+        yield function == null
+            ? -1
+            : store.functions.register(function.instance.backend, function.index);
+      }
     };
   }
 
@@ -437,8 +551,21 @@ public final class WasmRuntime implements AutoCloseable {
       case I64 -> value;
       case F32 -> Float.intBitsToFloat((int) value);
       case F64 -> Double.longBitsToDouble(value);
-      case EXTERNREF -> referenceValue((int) value);
-      case FUNCREF -> throw new IllegalArgumentException("WASM function values require a table");
+      case EXTERNREF ->
+          value < -1 || Value.isI31(value) ? gcValue(value) : referenceValue((int) value);
+      case GCREF, EXNREF -> gcValue(value);
+      case FUNCREF -> {
+        if (value == -1) yield null;
+        var reference = store.functions.get((int) value);
+        Instance owner = instances.get(reference.instance());
+        if (owner == null) throw new IllegalStateException("WASM function owner is closed");
+        owner.requireOpen();
+        yield new Function(
+            signature(owner.module.info, owner.module.info.functionType(reference.index())),
+            null,
+            owner,
+            reference.index());
+      }
     };
   }
 
@@ -448,6 +575,11 @@ public final class WasmRuntime implements AutoCloseable {
     long[] result = new long[types.size()];
     for (int i = 0; i < result.length; i++) result[i] = encode(types.get(i), values[i]);
     return result;
+  }
+
+  private static long invalidExceptionReference() {
+    throw new IllegalArgumentException(
+        "WASM exception reference requires an exception from this runtime");
   }
 
   private Object[] decode(List<Type> types, long[] values) {
@@ -466,19 +598,26 @@ public final class WasmRuntime implements AutoCloseable {
   }
 
   private Object referenceValue(int id) {
-    if (id == -1) return null;
-    if (!references.containsKey(id))
-      throw new IllegalStateException("WASM reference is no longer available");
     return references.get(id);
   }
 
   private void retain(Set<Integer> roots, GlobalInstance global) {
-    if (global.getType().equals(ValType.ExternRef)) roots.add((int) global.getValueLow());
+    if (global == null || !global.getType().isReference()) return;
+    String name = WasmValues.name(global.getType(), global.typeContext());
+    if (name.equals("externref") || name.equals("gcref")) {
+      if (global.getValueLow() >= 0 && !Value.isI31(global.getValueLow()))
+        roots.add((int) global.getValueLow());
+      else roots.addAll(store.heap.snapshot(global.getValueLow()).externals());
+    }
   }
 
   private void retain(Set<Integer> roots, TableInstance table) {
-    if (table.elementType().equals(ValType.ExternRef))
-      for (int i = 0; i < table.size(); i++) roots.add(table.ref(i));
+    if (table.holdsFunctions()) return;
+    for (int i = 0; i < table.size(); i++) {
+      int value = table.ref(i);
+      if (value >= 0) roots.add(value);
+      else roots.addAll(store.heap.snapshot(value).externals());
+    }
   }
 
   private void clean() {
@@ -490,10 +629,10 @@ public final class WasmRuntime implements AutoCloseable {
       for (Resource resource : new ArrayList<>(resources)) resource.dispose();
       store.clear();
       references.clear();
-      referenceIds.clear();
       return;
     }
-    Set<Integer> roots = new HashSet<>();
+    store.collectHeap();
+    Set<Integer> roots = new HashSet<>(store.heap.retainedSnapshot().externals());
     for (Instance instance : instances.values()) {
       for (int i = 0; i < instance.backend.globalCount(); i++)
         retain(roots, instance.backend.global(i));
@@ -504,14 +643,7 @@ public final class WasmRuntime implements AutoCloseable {
       if (resource.value instanceof GlobalInstance global) retain(roots, global);
       else if (resource.value instanceof TableInstance table) retain(roots, table);
     }
-    references
-        .entrySet()
-        .removeIf(
-            entry -> {
-              if (roots.contains(entry.getKey())) return false;
-              referenceIds.remove(entry.getValue());
-              return true;
-            });
+    references.retain(roots);
   }
 
   private void closeResource(Runnable cleanup) {
@@ -550,7 +682,7 @@ public final class WasmRuntime implements AutoCloseable {
                           Kind.valueOf(value.importType().name()),
                           value instanceof FunctionImport function
                               ? WasmRuntime.signature(
-                                  info.module.typeSection().getType(function.typeIndex()))
+                                  info, info.module.typeSection().getType(function.typeIndex()))
                               : null))
               .toList();
       List<Export> values = new ArrayList<>();
@@ -561,7 +693,7 @@ public final class WasmRuntime implements AutoCloseable {
                 value.name(),
                 Kind.valueOf(value.exportType().name()),
                 value.exportType() == ExternalType.FUNCTION
-                    ? WasmRuntime.signature(info.functionType(value.index()))
+                    ? WasmRuntime.signature(info, info.functionType(value.index()))
                     : null));
       }
       exports = List.copyOf(values);
@@ -688,7 +820,7 @@ public final class WasmRuntime implements AutoCloseable {
         if (spec instanceof FunctionImport function && value instanceof Function target) {
           requireOwner(target.owner());
           FunctionType expected = module.info.module.typeSection().getType(function.typeIndex());
-          if (!signature(expected).equals(target.signature))
+          if (!signature(module.info, expected).equals(target.signature))
             throw new LinkException(
                 "Incompatible WASM import: " + spec.module() + "." + spec.name());
           if (target.instance != null) {
@@ -715,12 +847,20 @@ public final class WasmRuntime implements AutoCloseable {
                         Object[] result =
                             target.callback.call(this, decode(target.signature.params(), args));
                         check();
-                        return encode(
-                            target.signature.results(),
-                            Objects.requireNonNull(result, "WASM host results"));
-                      } catch (Signal signal) {
+                        long[] encoded =
+                            encode(
+                                target.signature.results(),
+                                Objects.requireNonNull(result, "WASM host results"));
+                        validateFunctions(expected.returns(), encoded);
+                        return encoded;
+                      } catch (ExceptionValue exception) {
+                        requireOwner(exception.owner());
+                        throw exception.value;
+                      } catch (Signal | CancellationException signal) {
                         throw signal;
-                      } catch (Exception | Error error) {
+                      } catch (Exception error) {
+                        throw new ForeignException(error, reference(error));
+                      } catch (Error error) {
                         throw new Signal(error);
                       }
                     }));
@@ -733,15 +873,24 @@ public final class WasmRuntime implements AutoCloseable {
             values.add(new ImportTable(spec.module(), spec.name(), table));
           else if (spec instanceof GlobalImport && raw instanceof GlobalInstance global)
             values.add(new ImportGlobal(spec.module(), spec.name(), global));
+          else if (spec instanceof TagImport && raw instanceof TagInstance tag)
+            values.add(new ImportTag(spec.module(), spec.name(), tag));
           else throw new LinkException("Invalid WASM import: " + spec.module() + "." + spec.name());
         } else throw new LinkException("Missing WASM import: " + spec.module() + "." + spec.name());
       }
       return values;
     }
 
+    private void validateFunctions(List<ValType> types, long[] values) {
+      for (int i = 0; i < types.size(); i++)
+        validateValue(types.get(i), module.info.module.typeSection(), values[i]);
+    }
+
     private Object[] invoke(int index, Signature signature, Object[] arguments) {
       requireOpen();
-      long[] values = backend.getMachine().call(index, encode(signature.params(), arguments));
+      long[] encoded = encode(signature.params(), arguments);
+      validateFunctions(module.info.functionType(index).params(), encoded);
+      long[] values = backend.getMachine().call(index, encoded);
       requireOpen();
       return decode(signature.results(), values);
     }
@@ -838,6 +987,20 @@ public final class WasmRuntime implements AutoCloseable {
           });
     }
 
+    public Tag tag(String name) throws Exception {
+      return execute(
+          0,
+          () -> {
+            requireOpen();
+            String key = "tag:" + name;
+            Resource old = exports.get(key);
+            if (old != null && !old.closed.get()) return (Tag) old;
+            Tag result = new Tag(backend.tag(export(name, ExternalType.TAG)), this);
+            exports.put(key, result);
+            return result;
+          });
+    }
+
     public void cancel() {
       Call call = active;
       if (call != null && call.participants.containsKey(this)) call.canceled.set(true);
@@ -846,6 +1009,7 @@ public final class WasmRuntime implements AutoCloseable {
     private void dispose() {
       if (module == null) return;
       instances.remove(backend);
+      store.functions.release(backend);
       store.release(handle);
       for (Resource resource : exports.values()) resource.dispose();
       exports.clear();
@@ -858,6 +1022,122 @@ public final class WasmRuntime implements AutoCloseable {
     @Override
     public void close() {
       if (closed.compareAndSet(false, true)) closeResource(this::dispose);
+    }
+  }
+
+  public final class Tag extends Resource {
+
+    private Tag(TagInstance tag, Instance instance) {
+      super(tag, instance);
+    }
+
+    private WasmRuntime owner() {
+      return WasmRuntime.this;
+    }
+
+    public List<Type> parameters() throws Exception {
+      return execute(
+          0,
+          () -> {
+            TagInstance tag = (TagInstance) requireOpen();
+            return tag.type().params().stream()
+                .map(type -> valueType(type, tag.typeContext()))
+                .toList();
+          });
+    }
+  }
+
+  public final class ExceptionValue extends RuntimeException {
+
+    private final WasmException value;
+    private final GcRefStore.Handle root;
+
+    private ExceptionValue(WasmException value) {
+      super("WASM exception", null, false, false);
+      this.value = value;
+      root = store.heap.retain(value.address(store.heap));
+    }
+
+    private WasmRuntime owner() {
+      return WasmRuntime.this;
+    }
+
+    private int address() {
+      return root.address();
+    }
+
+    public boolean is(Tag tag) throws Exception {
+      requireOwner(tag.owner());
+      return execute(0, () -> value.tag() == tag.requireOpen());
+    }
+
+    public Object getArg(Tag tag, int index) throws Exception {
+      requireOwner(tag.owner());
+      return execute(
+          0,
+          () -> {
+            if (value.tag() != tag.requireOpen())
+              throw new IllegalArgumentException("WASM exception tag does not match");
+            if (index < 0 || index >= value.tag().type().params().size())
+              throw new IndexOutOfBoundsException(String.valueOf(index));
+            return decode(
+                valueType(value.tag().type().params().get(index), value.tag().typeContext()),
+                value.args()[index]);
+          });
+    }
+  }
+
+  private static final class ForeignException extends WasmException {
+
+    final Throwable failure;
+
+    ForeignException(Throwable failure, int reference) {
+      super(
+          new TagInstance(FunctionType.of(List.of(ValType.ExternRef), List.of())),
+          new long[] {reference});
+      this.failure = failure;
+    }
+  }
+
+  /**
+   * Opaque GC value. Closing releases this Java root; ordinary Java collection also releases it.
+   */
+  public final class Reference implements AutoCloseable {
+
+    private final GcRefStore.Handle value;
+    private final int address;
+    private final AtomicBoolean closed = new AtomicBoolean();
+
+    private Reference(GcRefStore.Handle value) {
+      this.value = value;
+      this.address = value.address();
+    }
+
+    private WasmRuntime owner() {
+      return WasmRuntime.this;
+    }
+
+    private int address() {
+      if (closed.get() || WasmRuntime.this.closed.get())
+        throw new IllegalStateException("WASM GC reference is closed");
+      return value.address();
+    }
+
+    @Override
+    public void close() {
+      if (closed.compareAndSet(false, true)) closeResource(value::close);
+    }
+
+    @Override
+    public boolean equals(Object other) {
+      return other instanceof WasmRuntime.Reference reference
+          && reference.owner() == owner()
+          && reference.address == address;
+    }
+
+    @Override
+    public int hashCode() {
+      return 31 * System.identityHashCode(owner()) + address;
     }
   }
 
@@ -904,6 +1184,16 @@ public final class WasmRuntime implements AutoCloseable {
       super(memory, instance);
     }
 
+    public SharedMemory sharedMemory() throws Exception {
+      return execute(
+          0,
+          () -> {
+            WasmMemory memory = (WasmMemory) requireOpen();
+            if (!memory.shared()) throw new IllegalStateException("WASM memory is not shared");
+            return memory.backing();
+          });
+    }
+
     public int pages() throws Exception {
       return execute(0, () -> ((WasmMemory) requireOpen()).pages());
     }
@@ -930,6 +1220,7 @@ public final class WasmRuntime implements AutoCloseable {
 
     private Global(GlobalInstance global, Instance instance) {
       super(global, instance);
+      global.bindReferences(store.heap);
     }
 
     public Object get() throws Exception {
@@ -937,7 +1228,7 @@ public final class WasmRuntime implements AutoCloseable {
           0,
           () -> {
             GlobalInstance global = (GlobalInstance) requireOpen();
-            return decode(publicType(global.getType()), global.getValueLow());
+            return decode(publicType(global), global.getValueLow());
           });
     }
 
@@ -948,7 +1239,9 @@ public final class WasmRuntime implements AutoCloseable {
             GlobalInstance global = (GlobalInstance) requireOpen();
             if (global.getMutabilityType() != MutabilityType.Var)
               throw new IllegalStateException("Immutable WASM global");
-            global.setValueLow(encode(publicType(global.getType()), value));
+            long encoded = encode(publicType(global), value);
+            validateValue(global.getType(), global.typeContext(), encoded);
+            global.setValueLow(encoded);
             return null;
           });
     }
@@ -969,17 +1262,25 @@ public final class WasmRuntime implements AutoCloseable {
           0,
           () -> {
             TableInstance table = (TableInstance) requireOpen();
-            if (table.elementType().equals(ValType.ExternRef))
-              return decode(Type.EXTERNREF, table.ref(index));
-            if (table.ref(index) == -1) return null;
-            Instance owner = instances.get(table.instance(index));
-            if (owner == null) throw new IllegalStateException("WASM function owner is closed");
-            return new Function(
-                signature(owner.module.info.functionType(table.ref(index))),
-                null,
-                owner,
-                table.ref(index));
+            Type type = valueType(table.elementType(), table.typeContext());
+            long raw = table.ref(index);
+            if (type == Type.FUNCREF && raw >= 0)
+              raw = store.functions.register(table.instance(index), (int) raw);
+            return decode(type, raw);
           });
+    }
+
+    private Object[] element(TableInstance table, Object value) {
+      Type type = valueType(table.elementType(), table.typeContext());
+      long encoded = encode(type, value);
+      validateValue(table.elementType(), table.typeContext(), encoded);
+      if (type == Type.FUNCREF && encoded != -1) {
+        var function = store.functions.get((int) encoded);
+        return new Object[] {function.index(), function.instance()};
+      }
+      if (Value.isI31(encoded))
+        encoded = store.heap.put(table.typeContext(), new WasmI31Ref(Value.decodeI31U(encoded)));
+      return new Object[] {(int) encoded, null};
     }
 
     public void set(int index, Object value) throws Exception {
@@ -987,12 +1288,9 @@ public final class WasmRuntime implements AutoCloseable {
           0,
           () -> {
             TableInstance table = (TableInstance) requireOpen();
-            Type type = publicType(table.elementType());
-            Function function = functionValue(type, value);
+            Object[] encoded = element(table, value);
             table.setRef(
-                index,
-                type == Type.EXTERNREF ? reference(value) : function == null ? -1 : function.index,
-                function == null ? null : function.instance.backend);
+                index, (Integer) encoded[0], (com.dylibso.chicory.runtime.Instance) encoded[1]);
             return null;
           });
     }
@@ -1002,12 +1300,9 @@ public final class WasmRuntime implements AutoCloseable {
           0,
           () -> {
             TableInstance table = (TableInstance) requireOpen();
-            Type type = publicType(table.elementType());
-            Function function = functionValue(type, value);
+            Object[] encoded = element(table, value);
             return table.grow(
-                count,
-                type == Type.EXTERNREF ? reference(value) : function == null ? -1 : function.index,
-                function == null ? null : function.instance.backend);
+                count, (Integer) encoded[0], (com.dylibso.chicory.runtime.Instance) encoded[1]);
           });
     }
   }

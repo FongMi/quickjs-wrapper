@@ -123,6 +123,23 @@ public final class QuickJS implements AutoCloseable {
     }
   }
 
+  /** Fixed-length shared storage from SharedMemory; use atomic access for synchronization. */
+  public static final class SharedBuffer {
+
+    private final ByteBuffer buffer;
+
+    SharedBuffer(ByteBuffer buffer) {
+      Objects.requireNonNull(buffer, "buffer");
+      if (!buffer.isDirect() || buffer.isReadOnly())
+        throw new IllegalArgumentException("Shared buffer must be direct and writable");
+      this.buffer = buffer.slice();
+    }
+
+    public ByteBuffer buffer() {
+      return buffer.duplicate();
+    }
+  }
+
   @FunctionalInterface
   public interface Function {
 
