@@ -1575,6 +1575,8 @@ JSValue reference_operation(Runtime *rt, const std::string &operation,
         }
         RESOURCE_FIELD("jniGlobalRefs", global_references.load(std::memory_order_relaxed) + quickjs_wrapper::shared_buffer_roots())
         RESOURCE_FIELD("sharedAllocations", quickjs_wrapper::shared_buffer_allocations())
+        RESOURCE_FIELD("sharedReservedBytes", quickjs_wrapper::shared_reserved_bytes())
+        RESOURCE_FIELD("sharedCommittedBytes", quickjs_wrapper::shared_committed_bytes())
         RESOURCE_FIELD("callbacks", rt->callbacks.size())
         RESOURCE_FIELD("callbackOrigins", rt->callback_origins.size())
         RESOURCE_FIELD("references", rt->references.size())

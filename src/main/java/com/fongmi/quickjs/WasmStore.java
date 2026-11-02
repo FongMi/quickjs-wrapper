@@ -29,8 +29,6 @@ final class WasmStore implements WasmMemory.Allocator {
 
   static final int MAX_MODULE = 16 * 1024 * 1024;
   static final int MAX_MODULES = 32 * 1024 * 1024;
-  private static final int MAX_MEMORY = 64 * 1024 * 1024;
-  private static final int MAX_TOTAL_MEMORY = 128 * 1024 * 1024;
   private static final int MAX_TABLE = 32768;
   private static final int MAX_TOTAL_TABLE = 65536;
   private static final int MAX_CACHED_MODULES = 8;
@@ -38,8 +36,7 @@ final class WasmStore implements WasmMemory.Allocator {
   private final Map<ByteBuffer, WasmModuleInfo> compiled = new LinkedHashMap<>(16, .75f, true);
   private final Map<Integer, Object> handles = new HashMap<>();
   private final IdentityHashMap<Object, Integer> identities = new IdentityHashMap<>();
-  private final ReferenceQueue<ByteBuffer> memoryQueue = new ReferenceQueue<>();
-  private final Map<PhantomReference<ByteBuffer>, Integer> allocations = new HashMap<>();
+  private final WasmMemoryBudget memoryBudget = new WasmMemoryBudget();
   private final ReferenceQueue<TableInstance> tableQueue = new ReferenceQueue<>();
   private final Map<PhantomReference<TableInstance>, Integer> tableAllocations = new HashMap<>();
   private final Runnable interruptionCheck;
@@ -50,7 +47,6 @@ final class WasmStore implements WasmMemory.Allocator {
   private final LongUnaryOperator internalize;
   private int nextId;
   private int moduleBytes;
-  private int memoryBytes;
   private int tableElements;
   private int cachedBytes;
 
@@ -103,8 +99,8 @@ final class WasmStore implements WasmMemory.Allocator {
 
   WasmMemory memory(MemoryLimits limits) {
     if (!limits.shared()) return new WasmMemory(limits, this);
-    SharedMemory.requireNative();
-    return memory(new SharedMemory(limits, allocate(SharedMemory.capacity(limits))));
+    check();
+    return memory(SharedMemory.allocate(limits, memoryBudget));
   }
 
   WasmMemory memory(SharedMemory memory) {
@@ -244,19 +240,7 @@ final class WasmStore implements WasmMemory.Allocator {
   @Override
   public ByteBuffer allocate(long size) {
     check();
-    for (var ref = memoryQueue.poll(); ref != null; ref = memoryQueue.poll())
-      memoryBytes -= allocations.remove(ref);
-    if (size < 0 || size > MAX_MEMORY || size > MAX_TOTAL_MEMORY - memoryBytes)
-      throw new WasmLimitException("WASM memory budget exhausted");
-    ByteBuffer buffer;
-    try {
-      buffer = ByteBuffer.allocateDirect((int) size);
-    } catch (OutOfMemoryError error) {
-      throw new WasmLimitException("WASM memory allocation failed");
-    }
-    allocations.put(new PhantomReference<>(buffer, memoryQueue), (int) size);
-    memoryBytes += (int) size;
-    return buffer;
+    return memoryBudget.allocate(size);
   }
 
   @Override
@@ -330,8 +314,7 @@ final class WasmStore implements WasmMemory.Allocator {
     compiled.clear();
     handles.clear();
     identities.clear();
-    allocations.clear();
     tableAllocations.clear();
-    moduleBytes = memoryBytes = tableElements = cachedBytes = 0;
+    moduleBytes = tableElements = cachedBytes = 0;
   }
 }
